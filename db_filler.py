@@ -79,6 +79,44 @@ def elevation_gain_from_tcx(xml_text: str) -> float:
     except Exception:
         return 0.0
 
+def heart_rate_from_tcx(xml_text: str) -> dict:
+    """Extract heart rate statistics from TCX content. Returns dict with avg_hr, max_hr, min_hr.
+    Ignores first 2 minutes of readings when calculating min_hr (following Fitbit approach)."""
+    try:
+        import re
+        
+        # Extract heart rate values using simple regex pattern (same as Fitbit approach)
+        heart_rates = re.findall(r'<HeartRateBpm><Value>(\d+)</Value></HeartRateBpm>', xml_text or "")
+        
+        # Try alternative patterns if first one doesn't work
+        if not heart_rates:
+            heart_rates = re.findall(r'<HeartRateBpm>(\d+)</HeartRateBpm>', xml_text or "")
+        if not heart_rates:
+            heart_rates = re.findall(r'<Value>(\d+)</Value>', xml_text or "")
+        
+        if not heart_rates:
+            return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
+        
+        # Convert to integers
+        heart_rates = [int(hr) for hr in heart_rates]
+        
+        # Calculate average and max using all data
+        avg_hr = sum(heart_rates) // len(heart_rates)
+        max_hr = max(heart_rates)
+        
+        # For min HR, ignore first 2 minutes of heart rate data
+        # Assuming ~1 reading per second, first 2 minutes = ~120 readings
+        first_two_minutes_readings = min(120, len(heart_rates))
+        min_hr = min(heart_rates[first_two_minutes_readings:]) if len(heart_rates) > first_two_minutes_readings else min(heart_rates)
+        
+        return {
+            'avg_hr': avg_hr,
+            'max_hr': max_hr,
+            'min_hr': min_hr
+        }
+    except Exception:
+        return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
+
 def map_activity_type(garmin_type: str) -> str:
     """Map Garmin activity type to standardized 'Run' or 'Treadmill run'."""
     if not garmin_type:
@@ -133,6 +171,32 @@ def compute_elevation_gain(activity: dict, client: Garmin) -> float:
             pass
     
     return 0.0
+
+def compute_heart_rate_from_tcx(activity: dict, client: Garmin) -> dict:
+    """Get heart rate statistics from TCX data as fallback. Returns dict with avg_hr, max_hr, min_hr."""
+    activity_id = activity.get('activityId')
+    if activity_id:
+        try:
+            # Try to get TCX data - handle different method signatures
+            tcx_data = None
+            if hasattr(client, 'download_activity'):
+                try:
+                    if hasattr(client, 'ActivityDownloadFormat'):
+                        tcx_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.TCX)
+                    else:
+                        tcx_data = client.download_activity(activity_id, dl_fmt='tcx')
+                except Exception:
+                    try:
+                        tcx_data = client.download_activity(activity_id)
+                    except Exception:
+                        pass
+            
+            if tcx_data:
+                return heart_rate_from_tcx(tcx_data)
+        except Exception:
+            pass
+    
+    return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
 
 def cache_run(date_str, distance, duration, steps, minhr, maxhr, avghr, calories, resting_hr=0, elev_gain=None, activity_type="Run"):
     con = sql.connect("cache.db")
@@ -473,6 +537,7 @@ def load_existing_dates():
 
 existing_dates = load_existing_dates()
 failure_counts = {}
+processed_activity_ids = set()  # Track activity IDs we've already processed to avoid duplicates
 
 # Check if we have complete data for the current date
 def date_is_complete(check_date):
@@ -534,7 +599,6 @@ while curr >= start_date:
     padded = padded_date_string(curr)
     unpadded = unpadded_date_string(curr)
     if date_is_complete(curr):
-        print(f"✓ Data already complete for {padded} - skipping API")
         curr = curr - timedelta(1)
         continue
 
@@ -601,11 +665,54 @@ while curr >= start_date:
                         print(f"  ⚠ Skipping run with 0 distance for {curr}")
                         continue
                     
-                    print(f"  ✓ Found {activity_type.lower()} for {curr}")
-                    date_str = padded_date_string(curr)
+                    # Get activity ID and check if we've already processed this activity
+                    activity_id = activity.get('activityId')
+                    if activity_id and activity_id in processed_activity_ids:
+                        # Already processed this activity, skip to avoid duplicate
+                        continue
+                    
+                    # Extract the actual date from the activity's startTimeLocal
+                    # Use the activity's actual date, not the loop date (curr)
+                    activity_start_time = activity.get('startTimeLocal', '')
+                    activity_date = curr  # Default to curr if we can't parse
+                    if activity_start_time:
+                        try:
+                            # Parse the startTimeLocal (format: "2024-11-20T10:30:00" or "2024-11-20 10:30:00")
+                            # Extract just the date part (YYYY-MM-DD)
+                            # Handle both 'T' separator and space separator
+                            if 'T' in activity_start_time:
+                                date_part = activity_start_time.split('T')[0]
+                            elif ' ' in activity_start_time:
+                                date_part = activity_start_time.split(' ')[0]
+                            else:
+                                date_part = activity_start_time[:10]  # Take first 10 chars if no separator
+                            
+                            if len(date_part) == 10 and date_part.count('-') == 2:
+                                activity_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+                        except Exception as e:
+                            print(f"    ⚠ Could not parse activity date from '{activity_start_time}', using loop date: {e}")
+                    
+                    date_str = padded_date_string(activity_date)
+                    
+                    # Check if this date already has a run (not just a placeholder) to avoid duplicates
+                    # This prevents the same activity from being cached twice when it appears in multiple API responses
+                    try:
+                        con = sql.connect("cache.db")
+                        cur = con.cursor()
+                        cur.execute("SELECT activity_type FROM runs WHERE date = ?", (date_str,))
+                        row = cur.fetchone()
+                        con.close()
+                        if row and row[0] and row[0] != 'None':
+                            # Date already has a run, skip to avoid duplicate
+                            print(f"  ⚠ Activity for {activity_date} already exists in database - skipping duplicate")
+                            break
+                    except Exception:
+                        pass  # If check fails, continue processing
+                    
+                    print(f"  ✓ Found {activity_type.lower()} for {activity_date}")
                     print(f"    {activity_type} {date_str}:")
                     print(f"    Activity ID: {activity.get('activityId', 'N/A')}")
-                    print(f"    Start Time: {activity.get('startTimeLocal', 'N/A')}")
+                    print(f"    Start Time: {activity_start_time}")
                     
                     # Get duration in seconds, convert to milliseconds
                     duration_sec = activity.get('duration', 0) or activity.get('elapsedDuration', 0)
@@ -623,31 +730,241 @@ while curr >= start_date:
                     
                     # Branch processing based on activity type
                     if activity_type == "Run":
-                        # Outdoor run logic
-                        avg_hr = activity.get('averageHeartRate', 0) or activity.get('avgHeartRate', 0) or activity.get('heartRate', {}).get('averageHeartRate', 0)
-                        max_hr = activity.get('maxHeartRate', 0) or activity.get('heartRate', {}).get('maxHeartRate', 0)
-                        min_hr = activity.get('minHeartRate', 0) or activity.get('heartRate', {}).get('minHeartRate', 0)
+                        # Outdoor run logic - initialize HR variables
+                        avg_hr = None
+                        max_hr = None
+                        min_hr = None
                         
-                        # Try to get detailed activity data for heart rate
+                        # Try to extract heart rate from activity summary first
+                        # Check multiple possible field names
+                        hr_dict = activity.get('heartRate', {})
+                        if isinstance(hr_dict, dict):
+                            avg_hr = hr_dict.get('averageHeartRate') or hr_dict.get('avgHeartRate')
+                            max_hr = hr_dict.get('maxHeartRate') or hr_dict.get('maximumHeartRate')
+                            min_hr = hr_dict.get('minHeartRate') or hr_dict.get('minimumHeartRate')
+                        
+                        # Also check top-level fields
+                        if avg_hr is None:
+                            avg_hr = activity.get('averageHeartRate') or activity.get('avgHeartRate')
+                        if max_hr is None:
+                            max_hr = activity.get('maxHeartRate') or activity.get('maximumHeartRate')
+                        if min_hr is None:
+                            min_hr = activity.get('minHeartRate') or activity.get('minimumHeartRate')
+                        
+                        # Debug: If we still don't have HR data, check what keys are available
+                        if avg_hr is None and max_hr is None:
+                            all_keys = list(activity.keys())
+                            hr_keys = [k for k in all_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
+                            if hr_keys:
+                                print(f"    Debug: Found HR-related keys in activity: {hr_keys}")
+                                # Try to extract from these keys
+                                for key in hr_keys:
+                                    val = activity.get(key)
+                                    if isinstance(val, (int, float)) and val > 0:
+                                        if 'avg' in key.lower() or 'average' in key.lower():
+                                            avg_hr = int(val)
+                                        elif 'max' in key.lower() or 'maximum' in key.lower():
+                                            max_hr = int(val)
+                                        elif 'min' in key.lower() or 'minimum' in key.lower():
+                                            min_hr = int(val)
+                                
+                                # Also check for HR zone data - sometimes max HR is in zone data
+                                # Check if there are HR zones that might contain max HR
+                                for key in hr_keys:
+                                    if 'zone' in key.lower() and 'max' in key.lower():
+                                        val = activity.get(key)
+                                        if isinstance(val, (int, float)) and val > 0:
+                                            max_hr = int(val)
+                                            break
+                        
+                        # Always try to get detailed activity data for heart rate if we have an activity_id
+                        # The detailed view often has more complete data
                         activity_id = activity.get('activityId')
-                        if activity_id and (not avg_hr or not max_hr):
+                        if activity_id:
                             try:
                                 # Try different methods to get activity details
                                 activity_details = None
                                 if hasattr(client, 'get_activity'):
-                                    activity_details = client.get_activity(activity_id)
-                                elif hasattr(client, 'get_activity_summary'):
-                                    activity_details = client.get_activity_summary(activity_id)
+                                    try:
+                                        activity_details = client.get_activity(activity_id)
+                                    except Exception as e1:
+                                        # Try alternative method
+                                        if hasattr(client, 'get_activity_summary'):
+                                            try:
+                                                activity_details = client.get_activity_summary(activity_id)
+                                            except Exception:
+                                                pass
+                                
+                                if not activity_details and hasattr(client, 'get_activity_summary'):
+                                    try:
+                                        activity_details = client.get_activity_summary(activity_id)
+                                    except Exception:
+                                        pass
+                                
+                                # Also try to get activity statistics if available
+                                activity_stats = None
+                                if hasattr(client, 'get_activity_statistics'):
+                                    try:
+                                        activity_stats = client.get_activity_statistics(activity_id)
+                                    except Exception:
+                                        pass
+                                
+                                # Extract HR from statistics if available
+                                if activity_stats:
+                                    if isinstance(activity_stats, dict):
+                                        stats_hr = activity_stats.get('heartRate', {})
+                                        if isinstance(stats_hr, dict):
+                                            if avg_hr is None:
+                                                avg_hr = stats_hr.get('averageHeartRate') or stats_hr.get('avgHeartRate')
+                                            if max_hr is None:
+                                                max_hr = stats_hr.get('maxHeartRate') or stats_hr.get('maximumHeartRate')
+                                            if min_hr is None:
+                                                min_hr = stats_hr.get('minHeartRate') or stats_hr.get('minimumHeartRate')
+                                        
+                                        # Check top-level stats fields
+                                        if avg_hr is None:
+                                            avg_hr = activity_stats.get('averageHeartRate') or activity_stats.get('avgHeartRate')
+                                        if max_hr is None:
+                                            max_hr = activity_stats.get('maxHeartRate') or activity_stats.get('maximumHeartRate')
+                                        if min_hr is None:
+                                            min_hr = activity_stats.get('minHeartRate') or activity_stats.get('minimumHeartRate')
                                 
                                 if activity_details:
-                                    if not avg_hr:
-                                        avg_hr = activity_details.get('averageHeartRate', 0) or activity_details.get('avgHeartRate', 0) or activity_details.get('heartRate', {}).get('averageHeartRate', 0)
-                                    if not max_hr:
-                                        max_hr = activity_details.get('maxHeartRate', 0) or activity_details.get('heartRate', {}).get('maxHeartRate', 0)
-                                    if not min_hr:
-                                        min_hr = activity_details.get('minHeartRate', 0) or activity_details.get('heartRate', {}).get('minHeartRate', 0)
+                                    # Check summaryDTO first - this is where Garmin typically stores summary data
+                                    summary_dto = activity_details.get('summaryDTO', {})
+                                    if isinstance(summary_dto, dict):
+                                        # Extract HR from summaryDTO - Garmin uses averageHR, maxHR, minHR (not averageHeartRate)
+                                        if avg_hr is None:
+                                            avg_hr = summary_dto.get('averageHR') or summary_dto.get('averageHeartRate') or summary_dto.get('avgHeartRate')
+                                        if max_hr is None:
+                                            max_hr = summary_dto.get('maxHR') or summary_dto.get('maxHeartRate') or summary_dto.get('maximumHeartRate')
+                                        if min_hr is None:
+                                            min_hr = summary_dto.get('minHR') or summary_dto.get('minHeartRate') or summary_dto.get('minimumHeartRate')
+                                        
+                                        # Also check nested heartRate object if it exists
+                                        hr_summary = summary_dto.get('heartRate', {})
+                                        if isinstance(hr_summary, dict):
+                                            if avg_hr is None:
+                                                avg_hr = hr_summary.get('averageHR') or hr_summary.get('averageHeartRate') or hr_summary.get('avgHeartRate')
+                                            if max_hr is None:
+                                                max_hr = hr_summary.get('maxHR') or hr_summary.get('maxHeartRate') or hr_summary.get('maximumHeartRate')
+                                            if min_hr is None:
+                                                min_hr = hr_summary.get('minHR') or hr_summary.get('minHeartRate') or hr_summary.get('minimumHeartRate')
+                                    
+                                    # Extract HR from detailed view, checking multiple field names
+                                    hr_details = activity_details.get('heartRate', {})
+                                    if isinstance(hr_details, dict):
+                                        if avg_hr is None:
+                                            avg_hr = hr_details.get('averageHeartRate') or hr_details.get('avgHeartRate')
+                                        if max_hr is None:
+                                            max_hr = hr_details.get('maxHeartRate') or hr_details.get('maximumHeartRate')
+                                        if min_hr is None:
+                                            min_hr = hr_details.get('minHeartRate') or hr_details.get('minimumHeartRate')
+                                    
+                                    # Also check top-level fields in details
+                                    if avg_hr is None:
+                                        avg_hr = activity_details.get('averageHeartRate') or activity_details.get('avgHeartRate')
+                                    if max_hr is None:
+                                        max_hr = activity_details.get('maxHeartRate') or activity_details.get('maximumHeartRate')
+                                    if min_hr is None:
+                                        min_hr = activity_details.get('minHeartRate') or activity_details.get('minimumHeartRate')
+                                    
+                                    # Check for summaryMetrics which might contain HR data
+                                    summary_metrics = activity_details.get('summaryMetrics', {})
+                                    if isinstance(summary_metrics, dict):
+                                        if avg_hr is None:
+                                            avg_hr = summary_metrics.get('averageHeartRate') or summary_metrics.get('avgHeartRate')
+                                        if max_hr is None:
+                                            max_hr = summary_metrics.get('maxHeartRate') or summary_metrics.get('maximumHeartRate')
+                                        if min_hr is None:
+                                            min_hr = summary_metrics.get('minHeartRate') or summary_metrics.get('minimumHeartRate')
+                                    
+                                    # Check for metrics array/list which might contain HR statistics
+                                    metrics = activity_details.get('metrics', [])
+                                    if isinstance(metrics, list):
+                                        for metric in metrics:
+                                            if isinstance(metric, dict):
+                                                metric_type = metric.get('metricType') or metric.get('type')
+                                                metric_value = metric.get('value') or metric.get('values', [])
+                                                if 'heart' in str(metric_type).lower() or 'hr' in str(metric_type).lower():
+                                                    if isinstance(metric_value, (int, float)) and metric_value > 0:
+                                                        if 'avg' in str(metric_type).lower() or 'average' in str(metric_type).lower():
+                                                            avg_hr = int(metric_value)
+                                                        elif 'max' in str(metric_type).lower() or 'maximum' in str(metric_type).lower():
+                                                            max_hr = int(metric_value)
+                                                        elif 'min' in str(metric_type).lower() or 'minimum' in str(metric_type).lower():
+                                                            min_hr = int(metric_value)
+                                                    elif isinstance(metric_value, list) and len(metric_value) > 0:
+                                                        # Sometimes HR data is in a list of values
+                                                        numeric_values = [v for v in metric_value if isinstance(v, (int, float)) and v > 0]
+                                                        if numeric_values:
+                                                            if 'avg' in str(metric_type).lower() or 'average' in str(metric_type).lower():
+                                                                avg_hr = int(sum(numeric_values) / len(numeric_values))
+                                                            elif 'max' in str(metric_type).lower() or 'maximum' in str(metric_type).lower():
+                                                                max_hr = int(max(numeric_values))
+                                                            elif 'min' in str(metric_type).lower() or 'minimum' in str(metric_type).lower():
+                                                                min_hr = int(min(numeric_values))
+                                    
+                                    # Debug: Check for any HR-related keys if we still don't have data
+                                    if avg_hr is None and max_hr is None:
+                                        # Check summaryDTO structure
+                                        if 'summaryDTO' in activity_details:
+                                            summary_dto = activity_details['summaryDTO']
+                                            if isinstance(summary_dto, dict):
+                                                sd_keys = list(summary_dto.keys())
+                                                hr_sd_keys = [k for k in sd_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
+                                                if hr_sd_keys:
+                                                    print(f"    Debug: Found HR-related keys in summaryDTO: {hr_sd_keys}")
+                                                    # Print values
+                                                    for key in hr_sd_keys[:10]:
+                                                        val = summary_dto.get(key)
+                                                        print(f"    Debug: summaryDTO.{key} = {val}")
+                                                
+                                                # Also print all summaryDTO keys to see structure
+                                                print(f"    Debug: All summaryDTO keys: {sd_keys[:30]}")
+                                        
+                                        # Look for any keys containing 'heart' or 'hr' (case insensitive)
+                                        all_keys = list(activity_details.keys())
+                                        hr_keys = [k for k in all_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
+                                        if hr_keys:
+                                            print(f"    Debug: Found HR-related keys in activity_details: {hr_keys}")
+                                            # Print the actual values for debugging
+                                            for key in hr_keys[:10]:  # Limit to first 10 to avoid spam
+                                                val = activity_details.get(key)
+                                                if isinstance(val, (int, float)) and val > 0:
+                                                    print(f"    Debug: {key} = {val}")
+                                        
+                                        # Also check if there's a nested structure we're missing
+                                        if 'summaryMetrics' in activity_details:
+                                            sm = activity_details['summaryMetrics']
+                                            if isinstance(sm, dict):
+                                                sm_keys = list(sm.keys())
+                                                hr_sm_keys = [k for k in sm_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
+                                                if hr_sm_keys:
+                                                    print(f"    Debug: Found HR-related keys in summaryMetrics: {hr_sm_keys}")
                             except Exception as e:
                                 print(f"    Could not fetch activity details: {e}")
+                        
+                        # Always try to extract HR from TCX (following Fitbit approach - TCX is most reliable source)
+                        if activity_id:
+                            try:
+                                tcx_hr = compute_heart_rate_from_tcx(activity, client)
+                                if tcx_hr.get('avg_hr'):
+                                    avg_hr = tcx_hr['avg_hr']
+                                    print(f"    Average HR: {avg_hr} (from TCX)")
+                                if tcx_hr.get('max_hr'):
+                                    max_hr = tcx_hr['max_hr']
+                                    print(f"    Max HR: {max_hr} (from TCX)")
+                                if tcx_hr.get('min_hr'):
+                                    min_hr = tcx_hr['min_hr']
+                                    print(f"    Min HR: {min_hr} (from TCX, ignoring first 2 minutes)")
+                            except Exception as e:
+                                print(f"    Could not extract HR from TCX: {e}")
+                        
+                        # Convert None to 0 for database storage (0 means no data, not a valid HR)
+                        avg_hr = avg_hr if avg_hr is not None else 0
+                        max_hr = max_hr if max_hr is not None else 0
+                        min_hr = min_hr if min_hr is not None else 0
                         
                         # Compute elevation gain in feet
                         elev_gain = compute_elevation_gain(activity, client)
@@ -660,18 +977,21 @@ while curr >= start_date:
                         avg_hr = manual_data['avg_hr']
                         elev_gain = manual_data['elev_gain']
                     
-                    print(f"    Average HR: {avg_hr if avg_hr else 'N/A'}")
-                    print(f"    Max HR: {max_hr if max_hr else 'N/A'}")
-                    print(f"    Min HR: {min_hr if min_hr else 'N/A'}")
+                    print(f"    Average HR: {avg_hr if (avg_hr and avg_hr > 0) else 'N/A'}")
+                    print(f"    Max HR: {max_hr if (max_hr and max_hr > 0) else 'N/A'}")
+                    print(f"    Min HR: {min_hr if (min_hr and min_hr > 0) else 'N/A'}")
                     
                     # Get resting heart rate for the day
                     resting_hr = get_resting_heart_rate(date_str, client)
                     print(f"    Resting HR: {resting_hr}")
-                    print(f"    Elevation Gain (ft): {elev_gain:.1f if elev_gain else 0:.1f}")
+                    print(f"    Elevation Gain (ft): {(elev_gain if elev_gain else 0.0):.1f}")
                     
                     print("-" * 50)
                     # Cache the run data
                     cache_run(date_str, distance, duration_ms, steps, min_hr, max_hr, avg_hr, calories, resting_hr, elev_gain, activity_type=activity_type)
+                    # Track this activity ID to prevent processing it again
+                    if activity_id:
+                        processed_activity_ids.add(activity_id)
                     existing_dates.add(date_str.strip())
                     try:
                         # Also add alt normalized forms
