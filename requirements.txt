@@ -1,0 +1,6 @@
+fitbit
+pandas
+python-dotenv
+requests
+matplotlib
+scipy
