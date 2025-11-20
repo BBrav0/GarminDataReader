@@ -3,6 +3,11 @@ import os
 import sys
 from pathlib import Path
 
+# Check Python version (requires 3.6+ for f-strings)
+if sys.version_info < (3, 6):
+    print("Error: Python 3.6 or higher is required. Current version: {}.{}".format(sys.version_info.major, sys.version_info.minor))
+    sys.exit(1)
+
 # Auto-detect and use venv Python if available
 def ensure_venv():
     """Re-execute script with venv Python if not already using it."""

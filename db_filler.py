@@ -3,6 +3,11 @@ import os
 import sys
 from pathlib import Path
 
+# Check Python version (requires 3.6+ for f-strings and garminconnect)
+if sys.version_info < (3, 6):
+    print("Error: Python 3.6 or higher is required. Current version: {}.{}".format(sys.version_info.major, sys.version_info.minor))
+    sys.exit(1)
+
 # Auto-detect and use venv Python if available
 def ensure_venv():
     """Re-execute script with venv Python if not already using it."""
@@ -17,9 +22,9 @@ def ensure_venv():
 
 ensure_venv()
 
-import fitbit
+from garminconnect import Garmin
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import os
 from dotenv import load_dotenv
 import sqlite3 as sql
@@ -74,32 +79,60 @@ def elevation_gain_from_tcx(xml_text: str) -> float:
     except Exception:
         return 0.0
 
-def compute_elevation_gain(activity: dict, access_token: str) -> float:
+def map_activity_type(garmin_type: str) -> str:
+    """Map Garmin activity type to standardized 'Run' or 'Treadmill run'."""
+    if not garmin_type:
+        return "Run"
+    
+    garmin_type_lower = garmin_type.lower().strip()
+    
+    # Treadmill activities
+    if 'treadmill' in garmin_type_lower:
+        return "Treadmill run"
+    
+    # All other running activities map to "Run"
+    running_keywords = ['running', 'run', 'street', 'track', 'trail', 'ultra', 'virtual', 'indoor', 'road']
+    if any(keyword in garmin_type_lower for keyword in running_keywords):
+        return "Run"
+    
+    # Default to "Run" for any unrecognized activity type
+    return "Run"
+
+def compute_elevation_gain(activity: dict, client: Garmin) -> float:
     """Get elevation gain in feet using API field if available, else TCX fallback."""
-    elev_m = activity.get('elevationGain')
+    # Try to get elevation gain from activity summary
+    elev_m = activity.get('elevationGain') or activity.get('elevationGainMeters') or activity.get('elevationGained') or activity.get('elevationAscent')
     try:
         if elev_m is not None:
             return float(elev_m) * 3.28084
     except Exception:
         pass
-    # Fallback to TCX
-    tcx_link = activity.get('tcxLink')
-    log_id = activity.get('logId')
-    tcx_xml = None
-    try:
-        if tcx_link:
-            r = requests.get(tcx_link, headers={'Authorization': f'Bearer {access_token}'}, timeout=30)
-            if r.status_code == 200:
-                tcx_xml = r.text
-        if tcx_xml is None and log_id:
-            url = f"https://api.fitbit.com/1/user/-/activities/{log_id}.tcx"
-            r = requests.get(url, headers={'Authorization': f'Bearer {access_token}'}, timeout=30)
-            if r.status_code == 200:
-                tcx_xml = r.text
-    except Exception:
-        tcx_xml = None
-    elev_from_tcx_m = elevation_gain_from_tcx(tcx_xml) if tcx_xml else 0.0
-    return elev_from_tcx_m * 3.28084
+    
+    # Fallback: try to get TCX/GPX data
+    activity_id = activity.get('activityId')
+    if activity_id:
+        try:
+            # Try to get TCX data - handle different method signatures
+            tcx_data = None
+            if hasattr(client, 'download_activity'):
+                try:
+                    if hasattr(client, 'ActivityDownloadFormat'):
+                        tcx_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.TCX)
+                    else:
+                        tcx_data = client.download_activity(activity_id, dl_fmt='tcx')
+                except Exception:
+                    try:
+                        tcx_data = client.download_activity(activity_id)
+                    except Exception:
+                        pass
+            
+            if tcx_data:
+                elev_from_tcx_m = elevation_gain_from_tcx(tcx_data)
+                return elev_from_tcx_m * 3.28084
+        except Exception:
+            pass
+    
+    return 0.0
 
 def cache_run(date_str, distance, duration, steps, minhr, maxhr, avghr, calories, resting_hr=0, elev_gain=None, activity_type="Run"):
     con = sql.connect("cache.db")
@@ -172,14 +205,26 @@ def cache_pending(date_str):
     con.commit()
     con.close()
 
-def get_resting_heart_rate(date_str):
+def get_resting_heart_rate(date_str, client: Garmin):
     """Get resting heart rate for a specific date"""
     try:
-        # Get resting heart rate from Fitbit API using intraday time series
-        resting_hr_data = auth_client.intraday_time_series('activities/heart', base_date=date_str, detail_level='1min')
-        if resting_hr_data and 'activities-heart' in resting_hr_data:
-            heart_data = resting_hr_data['activities-heart'][0]
-            return heart_data.get('value', {}).get('restingHeartRate', 0)
+        # Parse date string
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+        # Try different methods to get heart rate data
+        hr_data = None
+        if hasattr(client, 'get_heart_rates'):
+            hr_data = client.get_heart_rates(date_obj.isoformat())
+        elif hasattr(client, 'get_daily_summary'):
+            summary = client.get_daily_summary(date_obj.isoformat())
+            if summary and 'restingHeartRate' in summary:
+                return summary.get('restingHeartRate', 0)
+        elif hasattr(client, 'get_daily_summary_v2'):
+            summary = client.get_daily_summary_v2(date_obj.isoformat())
+            if summary and 'restingHeartRate' in summary:
+                return summary.get('restingHeartRate', 0)
+        
+        if hr_data and 'restingHeartRate' in hr_data:
+            return hr_data.get('restingHeartRate', 0)
         return 0
     except Exception as e:
         print(f"    Error getting resting heart rate: {e}")
@@ -244,29 +289,24 @@ def get_treadmill_manual_data(date_str, distance):
 
 load_dotenv()
 
-CLIENT_ID = os.getenv('CLIENT_ID')
-CLIENT_SECRET = os.getenv('CLIENT_SECRET')
-ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
-REFRESH_TOKEN = os.getenv('REFRESH_TOKEN')
+GARMIN_EMAIL = os.getenv('GARMIN_EMAIL')
+GARMIN_PASSWORD = os.getenv('GARMIN_PASSWORD')
 
-if not all([CLIENT_ID, CLIENT_SECRET, ACCESS_TOKEN, REFRESH_TOKEN]):
-    print("fix your .env")
+if not GARMIN_EMAIL or not GARMIN_PASSWORD:
+    print("fix your .env - set GARMIN_EMAIL and GARMIN_PASSWORD")
     exit(1)
 
 # ============================
 
 # ===== API SETUP =======
 
-# Configure requests session with timeout
-import requests
-session = requests.Session()
-session.timeout = 30  # 30 second timeout
-
-auth_client = fitbit.Fitbit(CLIENT_ID, CLIENT_SECRET,
-                          access_token=ACCESS_TOKEN,
-                          refresh_token=REFRESH_TOKEN,
-                          system='en_US',
-                          requests_kwargs={'timeout': 30})
+try:
+    client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+    client.login()
+    print("✓ Garmin authentication successful")
+except Exception as e:
+    print(f"✗ Garmin authentication failed: {e}")
+    exit(1)
 
 # =======================
 
@@ -519,133 +559,119 @@ while curr >= start_date:
             print("  Waiting 2 seconds before next request...")
             time.sleep(2)
         
-        # Get activities for current date with timeout
-        daily_activities = auth_client.activities(date=curr)
-        activities = daily_activities.get('activities', [])
+        # Get activities for current date
+        # Try different methods depending on garminconnect version
+        activities = None
+        try:
+            # Try get_activities_by_date first (if available)
+            if hasattr(client, 'get_activities_by_date'):
+                activities = client.get_activities_by_date(curr.isoformat())
+            elif hasattr(client, 'get_activities'):
+                # Get activities and filter by date
+                all_activities = client.get_activities(0, 100)  # Get first 100 activities
+                activities = [a for a in all_activities if a.get('startTimeLocal', '').startswith(curr.isoformat())]
+            else:
+                # Fallback: try to get activities for the date range
+                activities = client.get_activities_by_date(curr.isoformat(), curr.isoformat())
+        except Exception as e:
+            # If method doesn't exist or fails, try alternative
+            try:
+                all_activities = client.get_activities(0, 100)
+                activities = [a for a in all_activities if a.get('startTimeLocal', '').startswith(curr.isoformat())]
+            except Exception as e2:
+                print(f"  ⚠ Error fetching activities: {e2}")
+                activities = []
+        
         request_count += 1
         
         if activities:
             for activity in activities:
-                activity_type = activity.get('activityParentName', 'N/A')
+                # Get activity type from Garmin
+                garmin_activity_type = activity.get('activityType', {}).get('typeKey', '') or activity.get('activityType', '')
+                activity_type = map_activity_type(garmin_activity_type)
+                
+                # Only process Run or Treadmill run activities
                 if activity_type in ["Run", "Treadmill run"]:
+                    # Get distance in meters, convert to miles
+                    distance_m = activity.get('distance', 0) or activity.get('distanceMeters', 0)
+                    distance = distance_m / 1609.34  # Convert meters to miles
+                    
                     # Skip runs with 0 distance
-                    distance = activity.get('distance', 0)
                     if distance == 0:
                         print(f"  ⚠ Skipping run with 0 distance for {curr}")
                         continue
-                        
+                    
                     print(f"  ✓ Found {activity_type.lower()} for {curr}")
-                    date_str = str(curr)
+                    date_str = padded_date_string(curr)
                     print(f"    {activity_type} {date_str}:")
                     print(f"    Activity ID: {activity.get('activityId', 'N/A')}")
-                    print(f"    Start Time: {activity.get('startTime', 'N/A')}")
-                    print(f"    Duration: {activity.get('duration', 0)}")
-                    print(f"    Distance: {round(activity.get('distance', 0), 2)} miles")
-                    print(f"    Steps: {activity.get('steps', 0)}")
-                    print(f"    Calories: {activity.get('calories', 0)}")
+                    print(f"    Start Time: {activity.get('startTimeLocal', 'N/A')}")
+                    
+                    # Get duration in seconds, convert to milliseconds
+                    duration_sec = activity.get('duration', 0) or activity.get('elapsedDuration', 0)
+                    duration_ms = int(duration_sec * 1000) if duration_sec else 0
+                    print(f"    Duration: {format_duration(duration_ms)}")
+                    print(f"    Distance: {round(distance, 2)} miles")
+                    
+                    # Get steps
+                    steps = activity.get('steps', 0) or activity.get('stepsCount', 0)
+                    print(f"    Steps: {steps}")
+                    
+                    # Get calories
+                    calories = activity.get('calories', 0) or activity.get('caloriesConsumed', 0)
+                    print(f"    Calories: {calories}")
                     
                     # Branch processing based on activity type
                     if activity_type == "Run":
-                        # Existing outdoor run logic
-                        # Try to get heart rate from TCX file
-                        tcx_link = activity.get('tcxLink', '')
-                        avg_hr = 0
-                        max_hr = 0
-                        min_hr = 0
+                        # Outdoor run logic
+                        avg_hr = activity.get('averageHeartRate', 0) or activity.get('avgHeartRate', 0) or activity.get('heartRate', {}).get('averageHeartRate', 0)
+                        max_hr = activity.get('maxHeartRate', 0) or activity.get('heartRate', {}).get('maxHeartRate', 0)
+                        min_hr = activity.get('minHeartRate', 0) or activity.get('heartRate', {}).get('minHeartRate', 0)
+                        
+                        # Try to get detailed activity data for heart rate
+                        activity_id = activity.get('activityId')
+                        if activity_id and (not avg_hr or not max_hr):
+                            try:
+                                # Try different methods to get activity details
+                                activity_details = None
+                                if hasattr(client, 'get_activity'):
+                                    activity_details = client.get_activity(activity_id)
+                                elif hasattr(client, 'get_activity_summary'):
+                                    activity_details = client.get_activity_summary(activity_id)
+                                
+                                if activity_details:
+                                    if not avg_hr:
+                                        avg_hr = activity_details.get('averageHeartRate', 0) or activity_details.get('avgHeartRate', 0) or activity_details.get('heartRate', {}).get('averageHeartRate', 0)
+                                    if not max_hr:
+                                        max_hr = activity_details.get('maxHeartRate', 0) or activity_details.get('heartRate', {}).get('maxHeartRate', 0)
+                                    if not min_hr:
+                                        min_hr = activity_details.get('minHeartRate', 0) or activity_details.get('heartRate', {}).get('minHeartRate', 0)
+                            except Exception as e:
+                                print(f"    Could not fetch activity details: {e}")
+                        
                         # Compute elevation gain in feet
-                        elev_gain = compute_elevation_gain(activity, ACCESS_TOKEN)
+                        elev_gain = compute_elevation_gain(activity, client)
+                        
                     elif activity_type == "Treadmill run":
-                        # New treadmill run logic
-                        # Get manual data from user
+                        # Treadmill run logic - get manual data from user
                         manual_data = get_treadmill_manual_data(date_str, distance)
                         min_hr = manual_data['min_hr']
                         max_hr = manual_data['max_hr']
                         avg_hr = manual_data['avg_hr']
                         elev_gain = manual_data['elev_gain']
-                        tcx_link = None  # No TCX processing for treadmill runs
                     
-                    # Process TCX data only for outdoor runs
-                    if activity_type == "Run" and tcx_link:
-                        try:
-                            import requests
-                            tcx_response = requests.get(tcx_link, headers={'Authorization': f'Bearer {ACCESS_TOKEN}'})
-                            if tcx_response.status_code == 200:
-                                tcx_content = tcx_response.text
-                                # Parse TCX for heart rate data
-                                import re
-                                heart_rates = re.findall(r'<HeartRateBpm><Value>(\d+)</Value></HeartRateBpm>', tcx_content)
-                                if heart_rates:
-                                    heart_rates = [int(hr) for hr in heart_rates]
-                                    avg_hr = sum(heart_rates) // len(heart_rates)
-                                    max_hr = max(heart_rates)
-                                    print(f"    Average HR: {avg_hr} (from TCX)")
-                                    print(f"    Max HR: {max_hr} (from TCX)")
-                                else:
-                                    print(f"    Average HR: N/A (no heart rate data in TCX)")
-                            else:
-                                print(f"    Average HR: N/A (could not fetch TCX)")
-                        except Exception as e:
-                            print(f"    Average HR: N/A (error fetching TCX: {e})")
-                    else:
-                        print(f"    Average HR: N/A (no TCX link available)")
-                    
-                    print(f"    Log ID: {activity.get('logId', 'N/A')}")
-                    print(f"    TCX Link: {activity.get('tcxLink', 'N/A')}")
+                    print(f"    Average HR: {avg_hr if avg_hr else 'N/A'}")
+                    print(f"    Max HR: {max_hr if max_hr else 'N/A'}")
+                    print(f"    Min HR: {min_hr if min_hr else 'N/A'}")
                     
                     # Get resting heart rate for the day
-                    resting_hr = get_resting_heart_rate(date_str)
+                    resting_hr = get_resting_heart_rate(date_str, client)
                     print(f"    Resting HR: {resting_hr}")
-                    print(f"    Elevation Gain (ft): {elev_gain:.1f}")
-                    
-                    # Try to construct TCX URL manually if not available
-                    log_id = activity.get('logId', 'N/A')
-                    if log_id != 'N/A' and not activity.get('tcxLink'):
-                        tcx_url = f"https://api.fitbit.com/1/user/-/activities/{log_id}.tcx"
-                        print(f"    Constructed TCX URL: {tcx_url}")
-                        
-                        try:
-                            # Try direct HTTP request with timeout
-                            tcx_response = requests.get(tcx_url, headers={'Authorization': f'Bearer {ACCESS_TOKEN}'}, timeout=10)
-                            if tcx_response.status_code == 200:
-                                tcx_content = tcx_response.text
-                                print(f"    TCX file size: {len(tcx_content)} characters")
-                                
-                                # Parse TCX for heart rate data - try different patterns
-                                import re
-                                heart_rates = re.findall(r'<HeartRateBpm><Value>(\d+)</Value></HeartRateBpm>', tcx_content)
-                                if not heart_rates:
-                                    # Try alternative patterns
-                                    heart_rates = re.findall(r'<HeartRateBpm>(\d+)</HeartRateBpm>', tcx_content)
-                                if not heart_rates:
-                                    heart_rates = re.findall(r'<Value>(\d+)</Value>', tcx_content)
-                                
-                                if heart_rates:
-                                    heart_rates = [int(hr) for hr in heart_rates]
-                                    avg_hr = sum(heart_rates) // len(heart_rates)
-                                    max_hr = max(heart_rates)
-                                    
-                                    # Ignore first 2 minutes of heart rate data for min calculation
-                                    # Assuming ~1 reading per second, first 2 minutes = ~120 readings
-                                    first_two_minutes_readings = min(120, len(heart_rates))
-                                    min_hr = min(heart_rates[first_two_minutes_readings:]) if len(heart_rates) > first_two_minutes_readings else min(heart_rates)
-                                    
-                                    print(f"    Average HR: {avg_hr} (from constructed TCX)")
-                                    print(f"    Max HR: {max_hr} (from constructed TCX)")
-                                    print(f"    Min HR: {min_hr} (from constructed TCX, ignoring first 2 minutes)")
-                                    print(f"    Found {len(heart_rates)} heart rate readings")
-                                else:
-                                    print(f"    Average HR: N/A (no heart rate data in constructed TCX)")
-                                    # Show first 500 characters of TCX to debug
-                                    print(f"    TCX preview: {tcx_content[:500]}...")
-                            else:
-                                print(f"    Average HR: N/A (could not fetch constructed TCX: {tcx_response.status_code})")
-                        except Exception as e:
-                            print(f"    Average HR: N/A (error fetching constructed TCX: {e})")
+                    print(f"    Elevation Gain (ft): {elev_gain:.1f if elev_gain else 0:.1f}")
                     
                     print("-" * 50)
-                    # Cache the run data with heart rate info from TCX and resting HR
-                    cache_run(date_str, activity.get('distance', 0), activity.get('duration', 0), 
-                            activity.get('steps', 0), min_hr, max_hr, avg_hr, activity.get('calories', 0), resting_hr, elev_gain, activity_type=activity_type)
+                    # Cache the run data
+                    cache_run(date_str, distance, duration_ms, steps, min_hr, max_hr, avg_hr, calories, resting_hr, elev_gain, activity_type=activity_type)
                     existing_dates.add(date_str.strip())
                     try:
                         # Also add alt normalized forms
@@ -685,7 +711,7 @@ while curr >= start_date:
         continue
     except Exception as e:
         error_msg = str(e)
-        if 'retry-after' in error_msg.lower():
+        if 'rate limit' in error_msg.lower() or 'too many' in error_msg.lower():
             print(f"  ⚠ Rate limit hit for {curr}: {e}")
             print("  Waiting 100 seconds before retry...")
             time.sleep(100)

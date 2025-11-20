@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Update script that runs the Fitbit data update pipeline:
-1. get_tokens.py - Get/refresh OAuth tokens
-2. db_filler.py - Fetch and cache run data from Fitbit API
+Update script that runs the Garmin data update pipeline:
+1. get_tokens.py - Verify Garmin credentials and authentication
+2. db_filler.py - Fetch and cache run data from Garmin API
 3. db_to_csv.py - Export cached data to CSV
 """
 import subprocess
 import sys
 import os
 from pathlib import Path
+
+# Check Python version (requires 3.6+ for f-strings)
+if sys.version_info < (3, 6):
+    print("Error: Python 3.6 or higher is required. Current version: {}.{}".format(sys.version_info.major, sys.version_info.minor))
+    sys.exit(1)
 
 def get_venv_python():
     """Find and return the path to the venv Python interpreter."""
@@ -57,7 +62,7 @@ if __name__ == "__main__":
         "db_to_csv.py"
     ]
     
-    print("Starting Fitbit data update pipeline...")
+    print("Starting Garmin data update pipeline...")
     
     for script in scripts:
         success = run_script(script)
