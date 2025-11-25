@@ -57,7 +57,6 @@ def run_script(script_name):
 
 if __name__ == "__main__":
     scripts = [
-        "get_tokens.py",
         "db_filler.py",
         "db_to_csv.py"
     ]
