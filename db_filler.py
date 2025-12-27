@@ -117,12 +117,20 @@ def heart_rate_from_tcx(xml_text: str) -> dict:
     except Exception:
         return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
 
-def map_activity_type(garmin_type: str) -> str:
-    """Map Garmin activity type to standardized 'Run' or 'Treadmill run'."""
+def map_activity_type(garmin_type: str) -> str | None:
+    """Map Garmin activity type to standardized 'Run' or 'Treadmill run'.
+    Returns None for non-running activities (e.g., cycling, biking).
+    """
     if not garmin_type:
-        return "Run"
+        return None
     
     garmin_type_lower = garmin_type.lower().strip()
+    
+    # Explicitly exclude cycling/biking activities
+    cycling_keywords = ['cycling', 'bike', 'biking', 'bicycle', 'indoor_cycling', 'road_biking', 
+                        'mountain_biking', 'virtual_cycling', 'e_bike', 'ebike']
+    if any(keyword in garmin_type_lower for keyword in cycling_keywords):
+        return None
     
     # Treadmill activities
     if 'treadmill' in garmin_type_lower:
@@ -133,8 +141,8 @@ def map_activity_type(garmin_type: str) -> str:
     if any(keyword in garmin_type_lower for keyword in running_keywords):
         return "Run"
     
-    # Default to "Run" for any unrecognized activity type
-    return "Run"
+    # Don't default to "Run" - return None for unrecognized activity types
+    return None
 
 def compute_elevation_gain(activity: dict, client: Garmin) -> float:
     """Get elevation gain in feet using API field if available, else TCX fallback."""
@@ -653,6 +661,10 @@ while curr >= start_date:
                 # Get activity type from Garmin
                 garmin_activity_type = activity.get('activityType', {}).get('typeKey', '') or activity.get('activityType', '')
                 activity_type = map_activity_type(garmin_activity_type)
+                
+                # Skip if activity_type is None (not a run)
+                if activity_type is None:
+                    continue
                 
                 # Only process Run or Treadmill run activities
                 if activity_type in ["Run", "Treadmill run"]:
