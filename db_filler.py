@@ -497,7 +497,7 @@ print("db ready")
 
 # Set start date to February 20th of current year
 current_year = date.today().year
-start_date = date(2025, 2, 20)
+start_date = date(2026, 4, 1)
 curr = date.today()
 request_count = 0
 
