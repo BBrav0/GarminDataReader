@@ -18,6 +18,19 @@ if not GARMIN_EMAIL or not GARMIN_PASSWORD:
     print("ERROR: GARMIN_EMAIL / GARMIN_PASSWORD not set in .env")
     sys.exit(1)
 
+# ── Skip if already logged today ─────────────────────────────────────
+today = date.today().isoformat()
+log_path = Path.home() / ".hermes" / "workspace" / "rhr_log.jsonl"
+if log_path.exists():
+    for line in log_path.read_text().splitlines():
+        try:
+            if json.loads(line).get("date") == today:
+                rhr = json.loads(line).get("rhr")
+                print(f"RHR {today}: {rhr} bpm (already logged, skipping Garmin call)")
+                sys.exit(0)
+        except Exception:
+            pass
+
 # ── Auth ──────────────────────────────────────────────────────────────
 try:
     from garminconnect import Garmin
@@ -28,7 +41,6 @@ except Exception as e:
     sys.exit(1)
 
 # ── Fetch RHR ─────────────────────────────────────────────────────────
-today = date.today().isoformat()
 rhr = None
 
 try:
