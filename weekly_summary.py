@@ -4,18 +4,36 @@ weekly_summary.py — Generate a weekly running summary chart from cache.db.
 Reads purely from local SQLite — zero Garmin API calls.
 Saves to /tmp/weekly_summary.png
 """
+import os
+import sys
 import sqlite3, json
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent.absolute()
+
+# Auto-detect and use venv Python if available
+def ensure_venv():
+    """Re-execute script with venv Python if not already using it."""
+    if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+        return  # Already in a venv
+
+    venv_python = SCRIPT_DIR / "venv" / "bin" / "python3"
+
+    if venv_python.exists():
+        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
+ensure_venv()
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from datetime import date, timedelta, datetime
-from pathlib import Path
+from datetime import date, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
 # ── Config ────────────────────────────────────────────────────────────
-DB_PATH  = Path(__file__).parent / "cache.db"
+DB_PATH  = SCRIPT_DIR / "cache.db"
 RHR_LOG  = Path.home() / ".hermes" / "workspace" / "rhr_log.jsonl"
 OUT_PATH = "/tmp/weekly_summary.png"
 
@@ -44,7 +62,7 @@ def load_rhr_log():
     """Load rhr_log.jsonl — used for resting HR trend on non-run days too."""
     entries = {}
     if RHR_LOG.exists():
-        for line in RHR_LOG.read_text().splitlines():
+        for line in RHR_LOG.read_text(encoding="utf-8").splitlines():
             try:
                 d = json.loads(line)
                 entries[d["date"]] = d["rhr"]
@@ -181,6 +199,7 @@ if NO_DATA:
         ax.text(0.5, 0.5, 'No run data yet', ha='center', va='center',
                 transform=ax.transAxes, color=MUTED, fontsize=11)
     plt.savefig(OUT_PATH, dpi=150, bbox_inches='tight', facecolor=BG)
+    plt.close(fig)
     print(f"Saved (empty state) → {OUT_PATH}")
     exit(0)
 
@@ -274,4 +293,5 @@ else:
 ax5.set_title('Weekly Mileage — Last 8 Weeks', fontsize=10, pad=6)
 
 plt.savefig(OUT_PATH, dpi=150, bbox_inches='tight', facecolor=BG)
+plt.close(fig)
 print(f"Saved → {OUT_PATH}")

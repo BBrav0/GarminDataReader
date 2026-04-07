@@ -28,7 +28,7 @@ def ensure_venv():
 ensure_venv()
 
 from dotenv import load_dotenv, set_key, find_dotenv
-from garminconnect import Garmin
+from garmin_auth import login_to_garmin, retry_on_rate_limit
 
 # Load environment variables
 dotenv_path = find_dotenv()
@@ -42,12 +42,14 @@ def test_connection(email, password):
     """Test Garmin connection with provided credentials."""
     try:
         print("Testing Garmin connection...")
-        client = Garmin(email, password)
-        client.login()
+        client = login_to_garmin(email, password)
         print("✓ Connection successful")
         
         # Get user profile to verify
-        profile = client.get_user_profile()
+        profile = retry_on_rate_limit(
+            client.get_user_profile,
+            "Garmin profile lookup",
+        )
         display_name = profile.get('displayName', 'User')
         print(f"✓ Authenticated as: {display_name}")
         return True

@@ -1,4 +1,5 @@
 garminconnect
+numpy
 pandas
 python-dotenv
 requests
