@@ -1,211 +1,250 @@
 #!/usr/bin/env python3
+"""Fetch recent Garmin activities and keep the local SQLite cache usable."""
+
+from __future__ import annotations
+
 import os
 import sys
+import time
+from datetime import date
 from pathlib import Path
+from typing import Any
 
-# Check Python version (requires 3.6+ for f-strings and garminconnect)
 if sys.version_info < (3, 6):
-    print("Error: Python 3.6 or higher is required. Current version: {}.{}".format(sys.version_info.major, sys.version_info.minor))
+    print(
+        "Error: Python 3.6 or higher is required. Current version: {}.{}".format(
+            sys.version_info.major,
+            sys.version_info.minor,
+        )
+    )
     sys.exit(1)
 
-# Auto-detect and use venv Python if available
+
+SCRIPT_DIR = Path(__file__).parent.absolute()
+
+
 def ensure_venv():
-    """Re-execute script with venv Python if not already using it."""
-    if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
-        return  # Already in a venv
-    
-    script_dir = Path(__file__).parent.absolute()
-    venv_python = script_dir / "venv" / "bin" / "python3"
-    
-    if venv_python.exists():
-        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    """Re-execute with the project virtualenv if available."""
+    if hasattr(sys, "real_prefix") or (
+        hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix
+    ):
+        return
+
+    for env_name in (".venv", "venv"):
+        venv_python = SCRIPT_DIR / env_name / "bin" / "python3"
+        if venv_python.exists():
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+
 
 ensure_venv()
 
-from garminconnect import Garmin
-import pandas as pd
-from datetime import date, timedelta, datetime
-import os
-from dotenv import load_dotenv
-import sqlite3 as sql
-import time
 import requests
-from garmin_auth import login_to_garmin
+from dotenv import load_dotenv
 
-def format_duration(ms):
-    """Convert milliseconds to H:MM:SS string."""
+from garmin_auth import is_rate_limit_error, login_to_garmin
+from garmin_store import (
+    DEFAULT_BOOTSTRAP_START_DATE,
+    DB_PATH,
+    format_run_summary,
+    get_latest_run,
+    get_sync_window,
+    initialize_database,
+    set_sync_state,
+    upsert_run,
+)
+
+
+def first_value(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def as_int(value: Any) -> int | None:
     try:
-        total_seconds = max(0, int(ms) // 1000)
-    except Exception:
+        return int(value)
+    except (TypeError, ValueError):
         return None
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    return f"{hours}:{minutes:02d}:{seconds:02d}"
 
-def format_pace(distance_miles, ms):
-    """Compute average pace as HH:MM:SS string (zero-padded hours).
-    Returns None if distance is invalid or ms is None.
-    """
-    if distance_miles is None or ms is None:
-        return None
+
+def as_float(value: Any) -> float | None:
     try:
-        distance = float(distance_miles)
-        if distance <= 0:
-            return None
-        total_seconds = max(0, int(ms) // 1000)
-        seconds_per_mile = int(round(total_seconds / distance))
-        hours = seconds_per_mile // 3600
-        minutes = (seconds_per_mile % 3600) // 60
-        seconds = seconds_per_mile % 60
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    except Exception:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
-def elevation_gain_from_tcx(xml_text: str) -> float:
-    """Sum positive altitude deltas from TCX content. Returns meters."""
+
+def garmin_request(description: str, action, max_attempts: int = 3):
+    """Run one Garmin API request with bounded retries."""
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return action()
+        except Exception as error:  # pragma: no cover - exercised in integration use
+            last_error = error
+            retryable = is_rate_limit_error(error) or isinstance(
+                error,
+                (
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.RequestException,
+                ),
+            )
+            if not retryable or attempt >= max_attempts:
+                raise
+
+            if is_rate_limit_error(error):
+                delay_seconds = min(120, 30 * (2 ** (attempt - 1)))
+                print(
+                    f"⚠ {description} hit Garmin rate limits "
+                    f"(attempt {attempt}/{max_attempts}): {error}"
+                )
+            else:
+                delay_seconds = min(20, 5 * attempt)
+                print(
+                    f"⚠ {description} had a transient network error "
+                    f"(attempt {attempt}/{max_attempts}): {error}"
+                )
+            print(f"  Waiting {delay_seconds}s before retrying...")
+            time.sleep(delay_seconds)
+    raise RuntimeError(f"{description} failed: {last_error}")
+
+
+def elevation_gain_from_tcx(xml_text: str | bytes | bytearray | None) -> float | None:
+    """Sum positive altitude deltas from TCX content and return feet."""
     try:
         import re
-        alts = [float(x) for x in re.findall(r"<AltitudeMeters>([-+]?[0-9]*\.?[0-9]+)</AltitudeMeters>", xml_text or "")]
-        if not alts:
-            return 0.0
-        gain = 0.0
-        prev = alts[0]
-        for a in alts[1:]:
-            delta = a - prev
-            if delta > 0:
-                gain += delta
-            prev = a
-        return gain
-    except Exception:
-        return 0.0
 
-def heart_rate_from_tcx(xml_text: str) -> dict:
-    """Extract heart rate statistics from TCX content. Returns dict with avg_hr, max_hr, min_hr.
-    Ignores first 2 minutes of readings when calculating min_hr (following Fitbit approach)."""
+        if isinstance(xml_text, (bytes, bytearray)):
+            xml_text = xml_text.decode("utf-8", errors="replace")
+        altitudes = [
+            float(value)
+            for value in re.findall(
+                r"<AltitudeMeters>([-+]?[0-9]*\.?[0-9]+)</AltitudeMeters>",
+                xml_text or "",
+            )
+        ]
+    except Exception:
+        return None
+
+    if not altitudes:
+        return None
+
+    gain_meters = 0.0
+    previous = altitudes[0]
+    for altitude in altitudes[1:]:
+        delta = altitude - previous
+        if delta > 0:
+            gain_meters += delta
+        previous = altitude
+
+    return gain_meters * 3.28084
+
+
+def heart_rate_from_tcx(xml_text: str | bytes | bytearray | None) -> dict[str, int | None]:
+    """Extract avg/max/min HR from TCX content."""
     try:
         import re
-        
-        # Extract heart rate values using simple regex pattern (same as Fitbit approach)
-        heart_rates = re.findall(r'<HeartRateBpm><Value>(\d+)</Value></HeartRateBpm>', xml_text or "")
-        
-        # Try alternative patterns if first one doesn't work
-        if not heart_rates:
-            heart_rates = re.findall(r'<HeartRateBpm>(\d+)</HeartRateBpm>', xml_text or "")
-        if not heart_rates:
-            heart_rates = re.findall(r'<Value>(\d+)</Value>', xml_text or "")
-        
-        if not heart_rates:
-            return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
-        
-        # Convert to integers
-        heart_rates = [int(hr) for hr in heart_rates]
-        
-        # Calculate average and max using all data
-        avg_hr = sum(heart_rates) // len(heart_rates)
-        max_hr = max(heart_rates)
-        
-        # For min HR, ignore first 2 minutes of heart rate data
-        # Assuming ~1 reading per second, first 2 minutes = ~120 readings
-        first_two_minutes_readings = min(120, len(heart_rates))
-        min_hr = min(heart_rates[first_two_minutes_readings:]) if len(heart_rates) > first_two_minutes_readings else min(heart_rates)
-        
-        return {
-            'avg_hr': avg_hr,
-            'max_hr': max_hr,
-            'min_hr': min_hr
-        }
-    except Exception:
-        return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
 
-def map_activity_type(garmin_type: str) -> str | None:
-    """Map Garmin activity type to standardized 'Run' or 'Treadmill run'.
-    Returns None for non-running activities (e.g., cycling, biking).
-    """
+        if isinstance(xml_text, (bytes, bytearray)):
+            xml_text = xml_text.decode("utf-8", errors="replace")
+        values = re.findall(r"<HeartRateBpm><Value>(\d+)</Value></HeartRateBpm>", xml_text or "")
+        if not values:
+            values = re.findall(r"<HeartRateBpm>(\d+)</HeartRateBpm>", xml_text or "")
+    except Exception:
+        values = []
+
+    if not values:
+        return {"avghr": None, "maxhr": None, "minhr": None}
+
+    heart_rates = [int(value) for value in values]
+    ignored_start = min(120, len(heart_rates))
+    min_slice = heart_rates[ignored_start:] or heart_rates
+    return {
+        "avghr": sum(heart_rates) // len(heart_rates),
+        "maxhr": max(heart_rates),
+        "minhr": min(min_slice),
+    }
+
+
+def extract_activity_type_key(activity: dict[str, Any]) -> str:
+    raw_type = activity.get("activityType", "")
+    if isinstance(raw_type, dict):
+        return str(
+            raw_type.get("typeKey")
+            or raw_type.get("typeId")
+            or raw_type.get("parentTypeId")
+            or ""
+        )
+    return str(raw_type or "")
+
+
+def map_activity_type(garmin_type: str | None) -> str | None:
     if not garmin_type:
         return None
-    
+
     garmin_type_lower = garmin_type.lower().strip()
-    
-    # Explicitly exclude cycling/biking activities
-    cycling_keywords = ['cycling', 'bike', 'biking', 'bicycle', 'indoor_cycling', 'road_biking', 
-                        'mountain_biking', 'virtual_cycling', 'e_bike', 'ebike']
+    cycling_keywords = (
+        "cycling",
+        "bike",
+        "biking",
+        "bicycle",
+        "indoor_cycling",
+        "road_biking",
+        "mountain_biking",
+        "virtual_cycling",
+        "e_bike",
+        "ebike",
+    )
     if any(keyword in garmin_type_lower for keyword in cycling_keywords):
         return None
-    
-    # Treadmill activities
-    if 'treadmill' in garmin_type_lower:
+    if "treadmill" in garmin_type_lower:
         return "Treadmill run"
-    
-    # All other running activities map to "Run"
-    running_keywords = ['running', 'run', 'street', 'track', 'trail', 'ultra', 'virtual', 'indoor', 'road']
+
+    running_keywords = ("running", "run", "street", "track", "trail", "ultra", "virtual", "indoor", "road")
     if any(keyword in garmin_type_lower for keyword in running_keywords):
         return "Run"
-    
-    # Don't default to "Run" - return None for unrecognized activity types
     return None
 
-def extract_activity_type_key(activity: dict) -> str:
-    """Return the Garmin activity type key as a normalized string."""
-    activity_type = activity.get('activityType', '')
-    if isinstance(activity_type, dict):
-        return str(
-            activity_type.get('typeKey')
-            or activity_type.get('typeId')
-            or activity_type.get('parentTypeId')
-            or ''
-        )
-    return str(activity_type or '')
 
-def detect_gps_signal(activity: dict) -> bool | None:
-    """Return True when GPS/route data is clearly present, False when clearly absent, else None."""
+def detect_gps_signal(activity: dict[str, Any]) -> bool | None:
     gps_negative_signal = False
-    candidate_dicts = [activity]
-
-    summary_dto = activity.get('summaryDTO')
+    candidates = [activity]
+    summary_dto = activity.get("summaryDTO")
     if isinstance(summary_dto, dict):
-        candidate_dicts.append(summary_dto)
+        candidates.append(summary_dto)
 
-    for candidate in candidate_dicts:
+    for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-
-        if candidate.get('hasPolyline') is True or candidate.get('hasMap') is True:
+        if candidate.get("hasPolyline") is True or candidate.get("hasMap") is True:
             return True
-        if candidate.get('polyline'):
+        if candidate.get("polyline"):
             return True
-
         for lat_key, lon_key in (
-            ('startLatitude', 'startLongitude'),
-            ('beginLatitude', 'beginLongitude'),
-            ('endLatitude', 'endLongitude'),
+            ("startLatitude", "startLongitude"),
+            ("beginLatitude", "beginLongitude"),
+            ("endLatitude", "endLongitude"),
         ):
-            lat = candidate.get(lat_key)
-            lon = candidate.get(lon_key)
-            if lat not in (None, '', 0, 0.0) and lon not in (None, '', 0, 0.0):
+            latitude = candidate.get(lat_key)
+            longitude = candidate.get(lon_key)
+            if latitude not in (None, "", 0, 0.0) and longitude not in (None, "", 0, 0.0):
                 return True
-
-        if candidate.get('hasPolyline') is False or candidate.get('hasMap') is False:
+        if candidate.get("hasPolyline") is False or candidate.get("hasMap") is False:
             gps_negative_signal = True
 
-    if gps_negative_signal:
-        return False
-    return None
+    return False if gps_negative_signal else None
 
-def infer_activity_type(activity: dict) -> str | None:
-    """Infer outdoor vs treadmill runs from Garmin metadata without prompting the user."""
+
+def infer_activity_type(activity: dict[str, Any]) -> str | None:
     garmin_type = extract_activity_type_key(activity)
-    activity_type = map_activity_type(garmin_type)
-    if activity_type != "Run":
-        return activity_type
+    mapped = map_activity_type(garmin_type)
+    if mapped != "Run":
+        return mapped
 
     garmin_type_lower = garmin_type.lower().strip()
-    treadmill_keywords = [
-        'treadmill',
-        'indoor',
-        'virtual',
-    ]
-    if any(keyword in garmin_type_lower for keyword in treadmill_keywords):
+    if any(keyword in garmin_type_lower for keyword in ("treadmill", "indoor", "virtual")):
         return "Treadmill run"
 
     gps_signal = detect_gps_signal(activity)
@@ -213,858 +252,279 @@ def infer_activity_type(activity: dict) -> str | None:
         return "Run"
     if gps_signal is False:
         return "Treadmill run"
-
-    return activity_type
-
-def compute_elevation_gain(activity: dict, client: Garmin) -> float:
-    """Get elevation gain in feet using API field if available, else TCX fallback."""
-    # Try to get elevation gain from activity summary
-    elev_m = activity.get('elevationGain') or activity.get('elevationGainMeters') or activity.get('elevationGained') or activity.get('elevationAscent')
-    try:
-        if elev_m is not None:
-            return float(elev_m) * 3.28084
-    except Exception:
-        pass
-    
-    # Fallback: try to get TCX/GPX data
-    activity_id = activity.get('activityId')
-    if activity_id:
-        try:
-            # Try to get TCX data - handle different method signatures
-            tcx_data = None
-            if hasattr(client, 'download_activity'):
-                try:
-                    if hasattr(client, 'ActivityDownloadFormat'):
-                        tcx_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.TCX)
-                    else:
-                        tcx_data = client.download_activity(activity_id, dl_fmt='tcx')
-                except Exception:
-                    try:
-                        tcx_data = client.download_activity(activity_id)
-                    except Exception:
-                        pass
-            
-            if tcx_data:
-                elev_from_tcx_m = elevation_gain_from_tcx(tcx_data)
-                return elev_from_tcx_m * 3.28084
-        except Exception:
-            pass
-    
-    return 0.0
-
-def compute_heart_rate_from_tcx(activity: dict, client: Garmin) -> dict:
-    """Get heart rate statistics from TCX data as fallback. Returns dict with avg_hr, max_hr, min_hr."""
-    activity_id = activity.get('activityId')
-    if activity_id:
-        try:
-            # Try to get TCX data - handle different method signatures
-            tcx_data = None
-            if hasattr(client, 'download_activity'):
-                try:
-                    if hasattr(client, 'ActivityDownloadFormat'):
-                        tcx_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.TCX)
-                    else:
-                        tcx_data = client.download_activity(activity_id, dl_fmt='tcx')
-                except Exception:
-                    try:
-                        tcx_data = client.download_activity(activity_id)
-                    except Exception:
-                        pass
-            
-            if tcx_data:
-                return heart_rate_from_tcx(tcx_data)
-        except Exception:
-            pass
-    
-    return {'avg_hr': None, 'max_hr': None, 'min_hr': None}
-
-def cache_run(date_str, distance, duration, steps, minhr, maxhr, avghr, calories, resting_hr=0, elev_gain=None, activity_type="Run"):
-    con = sql.connect("cache.db")
-    cur = con.cursor()
-
-    # Store duration as formatted H:MM:SS string from milliseconds
-    formatted_duration = format_duration(duration) if duration is not None else None
-    # Compute cadence (steps per minute) as integer (rounded)
-    cadence = None
-    try:
-        minutes = (int(duration) / 60000.0) if duration is not None else None
-        if minutes and minutes > 0 and steps is not None:
-            cadence_value = float(steps) / float(minutes)
-            cadence = int(round(cadence_value))
-    except Exception:
-        cadence = None
-    average_pace = format_pace(distance, duration)
-    elev_gain_per_mile = None
-    try:
-        if elev_gain is not None and distance not in (None, 0):
-            elev_gain_per_mile = float(elev_gain) / float(distance)
-    except Exception:
-        elev_gain_per_mile = None
-
-    # Round REALs to two decimal places
-    def round2(value):
-        try:
-            return round(float(value), 2)
-        except Exception:
-            return value
-    distance = round2(distance) if distance is not None else None
-    elev_gain = round2(elev_gain) if elev_gain is not None else None
-    elev_gain_per_mile = round2(elev_gain_per_mile) if elev_gain_per_mile is not None else None
-
-    cur.execute("""
-        INSERT OR REPLACE INTO runs (date, distance, duration, avg_pace, elev_gain, elev_gain_per_mile, steps, cadence, minhr, maxhr, avghr, calories, resting_hr, activity_type) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (date_str, distance, formatted_duration, average_pace, elev_gain, elev_gain_per_mile, steps, cadence, minhr, maxhr, avghr, calories, resting_hr, activity_type))
-
-    con.commit()
-    con.close()
-
-def cache_no_run(date_str):
-    """Insert a placeholder for a date with no runs to avoid future API calls."""
-    con = sql.connect("cache.db")
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO runs (date, distance, duration, avg_pace, elev_gain, elev_gain_per_mile, steps, cadence, minhr, maxhr, avghr, calories, resting_hr, activity_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (date_str, None, None, None, None, None, None, None, None, None, None, None, None, "None"),
-    )
-    con.commit()
-    con.close()
-
-def cache_pending(date_str):
-    """Insert a placeholder for a date to ensure an entry exists.
-    Uses activity_type = 'None' (no run) as the default state.
-    """
-    con = sql.connect("cache.db")
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO runs (date, distance, duration, avg_pace, elev_gain, elev_gain_per_mile, steps, cadence, minhr, maxhr, avghr, calories, resting_hr, activity_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (date_str, None, None, None, None, None, None, None, None, None, None, None, None, "None"),
-    )
-    con.commit()
-    con.close()
-
-def get_resting_heart_rate(date_str, client: Garmin):
-    """Get resting heart rate for a specific date"""
-    try:
-        # Parse date string
-        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
-        # Try different methods to get heart rate data
-        hr_data = None
-        if hasattr(client, 'get_heart_rates'):
-            hr_data = client.get_heart_rates(date_obj.isoformat())
-        elif hasattr(client, 'get_daily_summary'):
-            summary = client.get_daily_summary(date_obj.isoformat())
-            if summary and 'restingHeartRate' in summary:
-                return summary.get('restingHeartRate', 0)
-        elif hasattr(client, 'get_daily_summary_v2'):
-            summary = client.get_daily_summary_v2(date_obj.isoformat())
-            if summary and 'restingHeartRate' in summary:
-                return summary.get('restingHeartRate', 0)
-        
-        if hr_data and 'restingHeartRate' in hr_data:
-            return hr_data.get('restingHeartRate', 0)
-        return 0
-    except Exception as e:
-        print(f"    Error getting resting heart rate: {e}")
-        return 0
-
-# ===== ENVIRONNENTALS =======
-
-load_dotenv()
-
-GARMIN_EMAIL = os.getenv('GARMIN_EMAIL')
-GARMIN_PASSWORD = os.getenv('GARMIN_PASSWORD')
-
-if not GARMIN_EMAIL or not GARMIN_PASSWORD:
-    print("fix your .env - set GARMIN_EMAIL and GARMIN_PASSWORD")
-    exit(1)
-
-# ============================
-
-# ===== API SETUP =======
-
-try:
-    client = login_to_garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-    print("✓ Garmin authentication successful")
-except Exception as e:
-    print(f"✗ Garmin authentication failed: {e}")
-    exit(1)
-
-# =======================
+    return mapped
 
 
-# ===== SQL SETUP =======
-
-
-con = sql.connect("cache.db")
-cur = con.cursor()
-
-cur.execute("""
-
-        CREATE TABLE IF NOT EXISTS runs (
-            date TEXT PRIMARY KEY,
-            distance REAL,
-            duration TEXT,
-            avg_pace TEXT,
-            elev_gain REAL,
-            elev_gain_per_mile REAL,
-            steps INTEGER,
-            cadence INTEGER,
-            minhr INTEGER,
-            maxhr INTEGER,
-            avghr INTEGER,
-            calories INTEGER,
-            resting_hr INTEGER,
-            activity_type TEXT
-        )
-
-""")
-
-con.commit()
-con.close()
-
-# Ensure schema has avg_pace and elev_gain columns for existing databases
-try:
-    con = sql.connect("cache.db")
-    cur = con.cursor()
-    cur.execute("PRAGMA table_info(runs)")
-    columns = [row[1] for row in cur.fetchall()]
-    if 'avg_pace' not in columns:
-        cur.execute("ALTER TABLE runs ADD COLUMN avg_pace TEXT")
-        con.commit()
-    if 'elev_gain' not in columns:
-        cur.execute("ALTER TABLE runs ADD COLUMN elev_gain REAL")
-        con.commit()
-    if 'elev_gain_per_mile' not in columns:
-        cur.execute("ALTER TABLE runs ADD COLUMN elev_gain_per_mile REAL")
-        con.commit()
-    if 'activity_type' not in columns:
-        cur.execute("ALTER TABLE runs ADD COLUMN activity_type TEXT")
-        con.commit()
-    # Ensure cadence column exists and is INTEGER type; migrate if needed
-    cur.execute("PRAGMA table_info(runs)")
-    info = cur.fetchall()
-    col_types = {row[1]: (row[2] or '').upper() for row in info}
-    if 'cadence' not in col_types:
-        cur.execute("ALTER TABLE runs ADD COLUMN cadence INTEGER")
-        con.commit()
-    elif col_types.get('cadence') != 'INTEGER':
-        # Migrate table to make cadence INTEGER via table recreate
-        try:
-            cur.execute("BEGIN TRANSACTION")
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS runs_new (
-                    date TEXT PRIMARY KEY,
-                    distance REAL,
-                    duration TEXT,
-                    avg_pace TEXT,
-                    elev_gain REAL,
-                    elev_gain_per_mile REAL,
-                    steps INTEGER,
-                    cadence INTEGER,
-                    minhr INTEGER,
-                    maxhr INTEGER,
-                    avghr INTEGER,
-                    calories INTEGER,
-                    resting_hr INTEGER,
-                    activity_type TEXT
-                )
-                """
-            )
-            # Copy with cadence cast to INTEGER (rounded)
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO runs_new (
-                    date, distance, duration, avg_pace, elev_gain, elev_gain_per_mile,
-                    steps, cadence, minhr, maxhr, avghr, calories, resting_hr, activity_type
-                )
-                SELECT
-                    date, distance, duration, avg_pace, elev_gain, elev_gain_per_mile,
-                    steps,
-                    CASE WHEN cadence IS NULL THEN NULL ELSE CAST(ROUND(cadence) AS INTEGER) END,
-                    minhr, maxhr, avghr, calories, resting_hr,
-                    CASE WHEN activity_type IS NULL THEN 'Run' ELSE activity_type END
-                FROM runs
-                """
-            )
-            cur.execute("DROP TABLE runs")
-            cur.execute("ALTER TABLE runs_new RENAME TO runs")
-            con.commit()
-        except Exception as me:
-            con.rollback()
-            print(f"warning: cadence type migration failed: {me}")
-    con.close()
-except Exception as e:
-    print(f"warning: could not ensure required columns exist: {e}")
-
-print("db ready")
-
-# =======================
-
-
-# ===== MAIN ========
-
-# Set start date to February 20th of current year
-current_year = date.today().year
-start_date = date(2026, 4, 1)
-curr = date.today()
-request_count = 0
-
-# Date helpers
-def padded_date_string(d):
-    try:
-        return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
-    except Exception:
-        return str(d)
-
-def unpadded_date_string(d):
-    try:
-        return f"{d.year}-{d.month}-{d.day}"
-    except Exception:
-        return str(d)
-
-# Preload all existing dates for fast membership checks (normalized variants)
-def load_existing_dates():
-    try:
-        con = sql.connect("cache.db")
-        cur = con.cursor()
-        cur.execute("SELECT date FROM runs")
-        rows = cur.fetchall()
-        con.close()
-        s = set()
-        for (raw,) in rows:
-            if raw is None:
-                continue
-            raw_stripped = str(raw).strip()
-            s.add(raw_stripped)
-            # Try to parse basic YYYY-MM-DD and also store unpadded/padded variants
-            try:
-                parts = raw_stripped.split("-")
-                if len(parts) == 3:
-                    y = int(parts[0])
-                    m = int(parts[1])
-                    d2 = int(parts[2])
-                    s.add(f"{y:04d}-{m:02d}-{d2:02d}")
-                    s.add(f"{y}-{m}-{d2}")
-            except Exception:
-                pass
-        return s
-    except Exception:
-        return set()
-
-existing_dates = load_existing_dates()
-failure_counts = {}
-processed_activity_ids = set()  # Track activity IDs we've already processed to avoid duplicates
-
-# Check if we have complete data for the current date
-def date_is_complete(check_date):
-    """Return True if the row exists and required fields are present.
-    Rule: if activity_type=='None' it's complete; if activity_type in ('Run', 'Treadmill run'), require elev_gain not NULL.
-    """
-    try:
-        con = sql.connect("cache.db")
-        cur = con.cursor()
-        cur.execute("SELECT activity_type, elev_gain, elev_gain_per_mile FROM runs WHERE date = ?", (str(check_date),))
-        row = cur.fetchone()
-        con.close()
-        if row is None:
-            return False
-        activity_type_val, elev_gain_val, elev_gain_per_mile_val = row
-        if activity_type_val == 'None':
-            return True
-        return (elev_gain_val is not None) and (elev_gain_per_mile_val is not None)
-    except Exception:
-        return False
-
-def date_exists(check_date):
-    """Return True if any row exists for the given date, regardless of completeness."""
-    try:
-        con = sql.connect("cache.db")
-        cur = con.cursor()
-        cur.execute("SELECT 1 FROM runs WHERE date = ? LIMIT 1", (str(check_date),))
-        row = cur.fetchone()
-        con.close()
-        return row is not None
-    except Exception:
-        return False
-
-def date_exists_loose(check_date):
-    """Return True if any row exists for the date, allowing suffixes (e.g., time).
-    Matches exact date or values starting with the date string.
-    """
-    try:
-        s_padded = padded_date_string(check_date)
-        s_unpadded = unpadded_date_string(check_date)
-        con = sql.connect("cache.db")
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT 1 FROM runs
-            WHERE date = ? OR date = ? OR date LIKE ? OR date LIKE ?
-            LIMIT 1
-            """,
-            (s_padded, s_unpadded, s_padded + '%', s_unpadded + '%')
-        )
-        row = cur.fetchone()
-        con.close()
-        return row is not None
-    except Exception:
-        return False
-
-while curr >= start_date:
-    # Skip only if the date is fully complete
-    padded = padded_date_string(curr)
-    unpadded = unpadded_date_string(curr)
-    if date_is_complete(curr):
-        curr = curr - timedelta(1)
-        continue
-
-    # Ensure a pending placeholder exists so interruptions still leave a row
-    try:
-        con = sql.connect("cache.db")
-        cur = con.cursor()
-        cur.execute("SELECT 1 FROM runs WHERE date = ? OR date = ? OR date LIKE ? OR date LIKE ? LIMIT 1", (padded, unpadded, padded + '%', unpadded + '%'))
-        exists_row = cur.fetchone() is not None
-        con.close()
-    except Exception:
-        exists_row = False
-    if not exists_row:
-        cache_pending(padded)
-    
-    days_remaining = (curr - start_date).days + 1
-    print(f"Processing {curr} ({days_remaining} days remaining)...")
-    
-    try:
-        # Add delay between requests to respect rate limits
-        if request_count > 0:
-            print("  Waiting 2 seconds before next request...")
-            time.sleep(2)
-        
-        # Get activities for current date
-        # Try different methods depending on garminconnect version
-        activities = None
-        try:
-            # Try get_activities_by_date first (if available)
-            if hasattr(client, 'get_activities_by_date'):
-                activities = client.get_activities_by_date(curr.isoformat())
-            elif hasattr(client, 'get_activities'):
-                # Get activities and filter by date
-                all_activities = client.get_activities(0, 100)  # Get first 100 activities
-                activities = [a for a in all_activities if a.get('startTimeLocal', '').startswith(curr.isoformat())]
-            else:
-                # Fallback: try to get activities for the date range
-                activities = client.get_activities_by_date(curr.isoformat(), curr.isoformat())
-        except Exception as e:
-            # If method doesn't exist or fails, try alternative
-            try:
-                all_activities = client.get_activities(0, 100)
-                activities = [a for a in all_activities if a.get('startTimeLocal', '').startswith(curr.isoformat())]
-            except Exception as e2:
-                print(f"  ⚠ Error fetching activities: {e2}")
-                activities = []
-        
-        request_count += 1
-        
-        if activities:
-            for activity in activities:
-                # Get activity type from Garmin
-                activity_type = infer_activity_type(activity)
-                
-                # Skip if activity_type is None (not a run)
-                if activity_type is None:
-                    continue
-                
-                # Only process Run or Treadmill run activities
-                if activity_type in ["Run", "Treadmill run"]:
-                    # Get distance in meters, convert to miles
-                    distance_m = activity.get('distance', 0) or activity.get('distanceMeters', 0)
-                    distance = distance_m / 1609.34  # Convert meters to miles
-                    
-                    # Skip runs with 0 distance
-                    if distance == 0:
-                        print(f"  ⚠ Skipping run with 0 distance for {curr}")
-                        continue
-                    
-                    # Get activity ID and check if we've already processed this activity
-                    activity_id = activity.get('activityId')
-                    if activity_id and activity_id in processed_activity_ids:
-                        # Already processed this activity, skip to avoid duplicate
-                        continue
-                    
-                    # Extract the actual date from the activity's startTimeLocal
-                    # Use the activity's actual date, not the loop date (curr)
-                    activity_start_time = activity.get('startTimeLocal', '')
-                    activity_date = curr  # Default to curr if we can't parse
-                    if activity_start_time:
-                        try:
-                            # Parse the startTimeLocal (format: "2024-11-20T10:30:00" or "2024-11-20 10:30:00")
-                            # Extract just the date part (YYYY-MM-DD)
-                            # Handle both 'T' separator and space separator
-                            if 'T' in activity_start_time:
-                                date_part = activity_start_time.split('T')[0]
-                            elif ' ' in activity_start_time:
-                                date_part = activity_start_time.split(' ')[0]
-                            else:
-                                date_part = activity_start_time[:10]  # Take first 10 chars if no separator
-                            
-                            if len(date_part) == 10 and date_part.count('-') == 2:
-                                activity_date = datetime.strptime(date_part, "%Y-%m-%d").date()
-                        except Exception as e:
-                            print(f"    ⚠ Could not parse activity date from '{activity_start_time}', using loop date: {e}")
-                    
-                    date_str = padded_date_string(activity_date)
-                    
-                    # Check if this date already has a run (not just a placeholder) to avoid duplicates
-                    # This prevents the same activity from being cached twice when it appears in multiple API responses
-                    try:
-                        con = sql.connect("cache.db")
-                        cur = con.cursor()
-                        cur.execute("SELECT activity_type FROM runs WHERE date = ?", (date_str,))
-                        row = cur.fetchone()
-                        con.close()
-                        if row and row[0] and row[0] != 'None':
-                            # Date already has a run, skip to avoid duplicate
-                            print(f"  ⚠ Activity for {activity_date} already exists in database - skipping duplicate")
-                            break
-                    except Exception:
-                        pass  # If check fails, continue processing
-                    
-                    print(f"  ✓ Found {activity_type.lower()} for {activity_date}")
-                    print(f"    {activity_type} {date_str}:")
-                    print(f"    Activity ID: {activity.get('activityId', 'N/A')}")
-                    print(f"    Start Time: {activity_start_time}")
-                    
-                    # Get duration in seconds, convert to milliseconds
-                    duration_sec = activity.get('duration', 0) or activity.get('elapsedDuration', 0)
-                    duration_ms = int(duration_sec * 1000) if duration_sec else 0
-                    print(f"    Duration: {format_duration(duration_ms)}")
-                    print(f"    Distance: {round(distance, 2)} miles")
-                    
-                    # Get steps
-                    steps = activity.get('steps', 0) or activity.get('stepsCount', 0)
-                    print(f"    Steps: {steps}")
-                    
-                    # Get calories
-                    calories = activity.get('calories', 0) or activity.get('caloriesConsumed', 0)
-                    print(f"    Calories: {calories}")
-                    
-                    # Automatic metric extraction for both outdoor and treadmill runs
-                    avg_hr = None
-                    max_hr = None
-                    min_hr = None
-                        
-                    # Try to extract heart rate from activity summary first
-                    # Check multiple possible field names
-                    hr_dict = activity.get('heartRate', {})
-                    if isinstance(hr_dict, dict):
-                        avg_hr = hr_dict.get('averageHeartRate') or hr_dict.get('avgHeartRate')
-                        max_hr = hr_dict.get('maxHeartRate') or hr_dict.get('maximumHeartRate')
-                        min_hr = hr_dict.get('minHeartRate') or hr_dict.get('minimumHeartRate')
-
-                    # Also check top-level fields
-                    if avg_hr is None:
-                        avg_hr = activity.get('averageHeartRate') or activity.get('avgHeartRate')
-                    if max_hr is None:
-                        max_hr = activity.get('maxHeartRate') or activity.get('maximumHeartRate')
-                    if min_hr is None:
-                        min_hr = activity.get('minHeartRate') or activity.get('minimumHeartRate')
-
-                    # Debug: If we still don't have HR data, check what keys are available
-                    if avg_hr is None and max_hr is None:
-                        all_keys = list(activity.keys())
-                        hr_keys = [k for k in all_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
-                        if hr_keys:
-                            print(f"    Debug: Found HR-related keys in activity: {hr_keys}")
-                            # Try to extract from these keys
-                            for key in hr_keys:
-                                val = activity.get(key)
-                                if isinstance(val, (int, float)) and val > 0:
-                                    if 'avg' in key.lower() or 'average' in key.lower():
-                                        avg_hr = int(val)
-                                    elif 'max' in key.lower() or 'maximum' in key.lower():
-                                        max_hr = int(val)
-                                    elif 'min' in key.lower() or 'minimum' in key.lower():
-                                        min_hr = int(val)
-
-                            # Also check for HR zone data - sometimes max HR is in zone data
-                            # Check if there are HR zones that might contain max HR
-                            for key in hr_keys:
-                                if 'zone' in key.lower() and 'max' in key.lower():
-                                    val = activity.get(key)
-                                    if isinstance(val, (int, float)) and val > 0:
-                                        max_hr = int(val)
-                                        break
-
-                    # Always try to get detailed activity data for heart rate if we have an activity_id
-                    # The detailed view often has more complete data
-                    activity_id = activity.get('activityId')
-                    if activity_id:
-                        try:
-                            # Try different methods to get activity details
-                            activity_details = None
-                            if hasattr(client, 'get_activity'):
-                                try:
-                                    activity_details = client.get_activity(activity_id)
-                                except Exception as e1:
-                                    # Try alternative method
-                                    if hasattr(client, 'get_activity_summary'):
-                                        try:
-                                            activity_details = client.get_activity_summary(activity_id)
-                                        except Exception:
-                                            pass
-
-                            if not activity_details and hasattr(client, 'get_activity_summary'):
-                                try:
-                                    activity_details = client.get_activity_summary(activity_id)
-                                except Exception:
-                                    pass
-
-                            # Also try to get activity statistics if available
-                            activity_stats = None
-                            if hasattr(client, 'get_activity_statistics'):
-                                try:
-                                    activity_stats = client.get_activity_statistics(activity_id)
-                                except Exception:
-                                    pass
-
-                            # Extract HR from statistics if available
-                            if activity_stats:
-                                if isinstance(activity_stats, dict):
-                                    stats_hr = activity_stats.get('heartRate', {})
-                                    if isinstance(stats_hr, dict):
-                                        if avg_hr is None:
-                                            avg_hr = stats_hr.get('averageHeartRate') or stats_hr.get('avgHeartRate')
-                                        if max_hr is None:
-                                            max_hr = stats_hr.get('maxHeartRate') or stats_hr.get('maximumHeartRate')
-                                        if min_hr is None:
-                                            min_hr = stats_hr.get('minHeartRate') or stats_hr.get('minimumHeartRate')
-
-                                    # Check top-level stats fields
-                                    if avg_hr is None:
-                                        avg_hr = activity_stats.get('averageHeartRate') or activity_stats.get('avgHeartRate')
-                                    if max_hr is None:
-                                        max_hr = activity_stats.get('maxHeartRate') or activity_stats.get('maximumHeartRate')
-                                    if min_hr is None:
-                                        min_hr = activity_stats.get('minHeartRate') or activity_stats.get('minimumHeartRate')
-
-                            if activity_details:
-                                # Check summaryDTO first - this is where Garmin typically stores summary data
-                                summary_dto = activity_details.get('summaryDTO', {})
-                                if isinstance(summary_dto, dict):
-                                    # Extract HR from summaryDTO - Garmin uses averageHR, maxHR, minHR (not averageHeartRate)
-                                    if avg_hr is None:
-                                        avg_hr = summary_dto.get('averageHR') or summary_dto.get('averageHeartRate') or summary_dto.get('avgHeartRate')
-                                    if max_hr is None:
-                                        max_hr = summary_dto.get('maxHR') or summary_dto.get('maxHeartRate') or summary_dto.get('maximumHeartRate')
-                                    if min_hr is None:
-                                        min_hr = summary_dto.get('minHR') or summary_dto.get('minHeartRate') or summary_dto.get('minimumHeartRate')
-
-                                    # Also check nested heartRate object if it exists
-                                    hr_summary = summary_dto.get('heartRate', {})
-                                    if isinstance(hr_summary, dict):
-                                        if avg_hr is None:
-                                            avg_hr = hr_summary.get('averageHR') or hr_summary.get('averageHeartRate') or hr_summary.get('avgHeartRate')
-                                        if max_hr is None:
-                                            max_hr = hr_summary.get('maxHR') or hr_summary.get('maxHeartRate') or hr_summary.get('maximumHeartRate')
-                                        if min_hr is None:
-                                            min_hr = hr_summary.get('minHR') or hr_summary.get('minHeartRate') or hr_summary.get('minimumHeartRate')
-
-                                # Extract HR from detailed view, checking multiple field names
-                                hr_details = activity_details.get('heartRate', {})
-                                if isinstance(hr_details, dict):
-                                    if avg_hr is None:
-                                        avg_hr = hr_details.get('averageHeartRate') or hr_details.get('avgHeartRate')
-                                    if max_hr is None:
-                                        max_hr = hr_details.get('maxHeartRate') or hr_details.get('maximumHeartRate')
-                                    if min_hr is None:
-                                        min_hr = hr_details.get('minHeartRate') or hr_details.get('minimumHeartRate')
-
-                                # Also check top-level fields in details
-                                if avg_hr is None:
-                                    avg_hr = activity_details.get('averageHeartRate') or activity_details.get('avgHeartRate')
-                                if max_hr is None:
-                                    max_hr = activity_details.get('maxHeartRate') or activity_details.get('maximumHeartRate')
-                                if min_hr is None:
-                                    min_hr = activity_details.get('minHeartRate') or activity_details.get('minimumHeartRate')
-
-                                # Check for summaryMetrics which might contain HR data
-                                summary_metrics = activity_details.get('summaryMetrics', {})
-                                if isinstance(summary_metrics, dict):
-                                    if avg_hr is None:
-                                        avg_hr = summary_metrics.get('averageHeartRate') or summary_metrics.get('avgHeartRate')
-                                    if max_hr is None:
-                                        max_hr = summary_metrics.get('maxHeartRate') or summary_metrics.get('maximumHeartRate')
-                                    if min_hr is None:
-                                        min_hr = summary_metrics.get('minHeartRate') or summary_metrics.get('minimumHeartRate')
-
-                                # Check for metrics array/list which might contain HR statistics
-                                metrics = activity_details.get('metrics', [])
-                                if isinstance(metrics, list):
-                                    for metric in metrics:
-                                        if isinstance(metric, dict):
-                                            metric_type = metric.get('metricType') or metric.get('type')
-                                            metric_value = metric.get('value') or metric.get('values', [])
-                                            if 'heart' in str(metric_type).lower() or 'hr' in str(metric_type).lower():
-                                                if isinstance(metric_value, (int, float)) and metric_value > 0:
-                                                    if 'avg' in str(metric_type).lower() or 'average' in str(metric_type).lower():
-                                                        avg_hr = int(metric_value)
-                                                    elif 'max' in str(metric_type).lower() or 'maximum' in str(metric_type).lower():
-                                                        max_hr = int(metric_value)
-                                                    elif 'min' in str(metric_type).lower() or 'minimum' in str(metric_type).lower():
-                                                        min_hr = int(metric_value)
-                                                elif isinstance(metric_value, list) and len(metric_value) > 0:
-                                                    # Sometimes HR data is in a list of values
-                                                    numeric_values = [v for v in metric_value if isinstance(v, (int, float)) and v > 0]
-                                                    if numeric_values:
-                                                        if 'avg' in str(metric_type).lower() or 'average' in str(metric_type).lower():
-                                                            avg_hr = int(sum(numeric_values) / len(numeric_values))
-                                                        elif 'max' in str(metric_type).lower() or 'maximum' in str(metric_type).lower():
-                                                            max_hr = int(max(numeric_values))
-                                                        elif 'min' in str(metric_type).lower() or 'minimum' in str(metric_type).lower():
-                                                            min_hr = int(min(numeric_values))
-
-                                # Debug: Check for any HR-related keys if we still don't have data
-                                if avg_hr is None and max_hr is None:
-                                    # Check summaryDTO structure
-                                    if 'summaryDTO' in activity_details:
-                                        summary_dto = activity_details['summaryDTO']
-                                        if isinstance(summary_dto, dict):
-                                            sd_keys = list(summary_dto.keys())
-                                            hr_sd_keys = [k for k in sd_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
-                                            if hr_sd_keys:
-                                                print(f"    Debug: Found HR-related keys in summaryDTO: {hr_sd_keys}")
-                                                # Print values
-                                                for key in hr_sd_keys[:10]:
-                                                    val = summary_dto.get(key)
-                                                    print(f"    Debug: summaryDTO.{key} = {val}")
-
-                                            # Also print all summaryDTO keys to see structure
-                                            print(f"    Debug: All summaryDTO keys: {sd_keys[:30]}")
-
-                                    # Look for any keys containing 'heart' or 'hr' (case insensitive)
-                                    all_keys = list(activity_details.keys())
-                                    hr_keys = [k for k in all_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
-                                    if hr_keys:
-                                        print(f"    Debug: Found HR-related keys in activity_details: {hr_keys}")
-                                        # Print the actual values for debugging
-                                        for key in hr_keys[:10]:  # Limit to first 10 to avoid spam
-                                            val = activity_details.get(key)
-                                            if isinstance(val, (int, float)) and val > 0:
-                                                print(f"    Debug: {key} = {val}")
-
-                                    # Also check if there's a nested structure we're missing
-                                    if 'summaryMetrics' in activity_details:
-                                        sm = activity_details['summaryMetrics']
-                                        if isinstance(sm, dict):
-                                            sm_keys = list(sm.keys())
-                                            hr_sm_keys = [k for k in sm_keys if 'heart' in k.lower() or (k.lower().startswith('hr') and len(k) > 2)]
-                                            if hr_sm_keys:
-                                                print(f"    Debug: Found HR-related keys in summaryMetrics: {hr_sm_keys}")
-                        except Exception as e:
-                            print(f"    Could not fetch activity details: {e}")
-
-                    # Always try to extract HR from TCX (following Fitbit approach - TCX is most reliable source)
-                    if activity_id:
-                        try:
-                            tcx_hr = compute_heart_rate_from_tcx(activity, client)
-                            if tcx_hr.get('avg_hr'):
-                                avg_hr = tcx_hr['avg_hr']
-                                print(f"    Average HR: {avg_hr} (from TCX)")
-                            if tcx_hr.get('max_hr'):
-                                max_hr = tcx_hr['max_hr']
-                                print(f"    Max HR: {max_hr} (from TCX)")
-                            if tcx_hr.get('min_hr'):
-                                min_hr = tcx_hr['min_hr']
-                                print(f"    Min HR: {min_hr} (from TCX, ignoring first 2 minutes)")
-                        except Exception as e:
-                            print(f"    Could not extract HR from TCX: {e}")
-
-                    # Convert None to 0 for database storage (0 means no data, not a valid HR)
-                    avg_hr = avg_hr if avg_hr is not None else 0
-                    max_hr = max_hr if max_hr is not None else 0
-                    min_hr = min_hr if min_hr is not None else 0
-
-                    # Compute elevation gain in feet
-                    elev_gain = compute_elevation_gain(activity, client)
-                    if activity_type == "Treadmill run" and not elev_gain:
-                        elev_gain = 0.0
-                    
-                    print(f"    Average HR: {avg_hr if (avg_hr and avg_hr > 0) else 'N/A'}")
-                    print(f"    Max HR: {max_hr if (max_hr and max_hr > 0) else 'N/A'}")
-                    print(f"    Min HR: {min_hr if (min_hr and min_hr > 0) else 'N/A'}")
-                    
-                    # Get resting heart rate for the day
-                    resting_hr = get_resting_heart_rate(date_str, client)
-                    print(f"    Resting HR: {resting_hr}")
-                    print(f"    Elevation Gain (ft): {(elev_gain if elev_gain else 0.0):.1f}")
-                    
-                    print("-" * 50)
-                    # Cache the run data
-                    cache_run(date_str, distance, duration_ms, steps, min_hr, max_hr, avg_hr, calories, resting_hr, elev_gain, activity_type=activity_type)
-                    # Track this activity ID to prevent processing it again
-                    if activity_id:
-                        processed_activity_ids.add(activity_id)
-                    existing_dates.add(date_str.strip())
-                    try:
-                        # Also add alt normalized forms
-                        parts = date_str.strip().split("-")
-                        if len(parts) == 3:
-                            y = int(parts[0]); m = int(parts[1]); d2 = int(parts[2])
-                            existing_dates.add(f"{y:04d}-{m:02d}-{d2:02d}")
-                            existing_dates.add(f"{y}-{m}-{d2}")
-                    except Exception:
-                        pass
-                    break
-        else:
-            print(f"  No runs found for {curr}")
-            # Cache a placeholder to avoid re-querying this date
-            cache_no_run(padded_date_string(curr))
-            existing_dates.add(padded)
-            existing_dates.add(unpadded)
-            
-        # Move to previous day after successful processing (regardless of runs found)
-        curr = curr - timedelta(1)
-        
-    except requests.exceptions.Timeout:
-        print(f"  ⚠ Timeout getting activities for {curr}")
-        key = padded_date_string(curr)
-        failure_counts[key] = failure_counts.get(key, 0) + 1
-        if failure_counts[key] >= 2:
-            print(f"  ⚠ Marking {key} as no-run after repeated timeouts")
-            cache_no_run(key)
-            existing_dates.add(key)
-        # Move to previous day
-        curr = curr - timedelta(1)
-    except requests.exceptions.RequestException as e:
-        print(f"  ⚠ Network error for {curr}: {e}")
-        print("  Waiting 30 seconds before retry...")
-        time.sleep(30)
-        # Don't move to next date - retry the same date
-        continue
-    except Exception as e:
-        error_msg = str(e)
-        if 'rate limit' in error_msg.lower() or 'too many' in error_msg.lower():
-            print(f"  ⚠ Rate limit hit for {curr}: {e}")
-            print("  Waiting 100 seconds before retry...")
-            time.sleep(100)
-            # Don't move to next date - retry the same date
+def iter_metric_sources(*activities: dict[str, Any] | None):
+    for activity in activities:
+        if not isinstance(activity, dict):
             continue
-        else:
-            print(f"  ❌ Error getting activities for {curr}: {e}")
-            key = padded_date_string(curr)
-            failure_counts[key] = failure_counts.get(key, 0) + 1
-            if failure_counts[key] >= 2:
-                print(f"  ⚠ Marking {key} as no-run after repeated errors")
-                cache_no_run(key)
-                existing_dates.add(key)
-            # Move to previous day for other errors
-            curr = curr - timedelta(1)
+        yield activity
+        summary_dto = activity.get("summaryDTO")
+        if isinstance(summary_dto, dict):
+            yield summary_dto
+        heart_rate = activity.get("heartRate")
+        if isinstance(heart_rate, dict):
+            yield heart_rate
 
-print(f"\nCompleted processing {request_count} API requests")
+
+def extract_heart_rate_metrics(*activities: dict[str, Any] | None) -> dict[str, int | None]:
+    avg_keys = ("averageHR", "averageHeartRate", "avgHeartRate")
+    max_keys = ("maxHR", "maxHeartRate", "maximumHeartRate")
+    min_keys = ("minHR", "minHeartRate", "minimumHeartRate")
+
+    def lookup(*keys: str) -> int | None:
+        for candidate in iter_metric_sources(*activities):
+            for key in keys:
+                value = as_int(candidate.get(key))
+                if value and value > 0:
+                    return value
+        return None
+
+    return {
+        "avghr": lookup(*avg_keys),
+        "maxhr": lookup(*max_keys),
+        "minhr": lookup(*min_keys),
+    }
+
+
+def extract_elevation_gain_feet(*activities: dict[str, Any] | None) -> float | None:
+    elevation_keys = (
+        "elevationGain",
+        "elevationGainMeters",
+        "elevationGained",
+        "elevationAscent",
+        "elevationGainInMeters",
+    )
+    for activity in iter_metric_sources(*activities):
+        for key in elevation_keys:
+            meters = as_float(activity.get(key))
+            if meters is not None:
+                return meters * 3.28084
+    return None
+
+
+def parse_start_time_local(activity: dict[str, Any]) -> str | None:
+    value = first_value(
+        activity.get("startTimeLocal"),
+        activity.get("summaryDTO", {}).get("startTimeLocal") if isinstance(activity.get("summaryDTO"), dict) else None,
+    )
+    if value is None:
+        return None
+    return str(value).replace(" ", "T")
+
+
+def parse_activity_date(activity: dict[str, Any]) -> str:
+    start_time_local = parse_start_time_local(activity)
+    if start_time_local:
+        return start_time_local[:10]
+    return date.today().isoformat()
+
+
+def download_activity_tcx(client, activity_id: int | str) -> str | bytes | None:
+    if not hasattr(client, "download_activity"):
+        return None
+
+    def download():
+        if hasattr(client, "ActivityDownloadFormat"):
+            return client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.TCX)
+        return client.download_activity(activity_id, dl_fmt="tcx")
+
+    try:
+        return garmin_request(f"activity download {activity_id}", download, max_attempts=2)
+    except Exception:
+        return None
+
+
+def get_resting_heart_rate(date_str: str, client) -> int | None:
+    """Fetch RHR for a single day, using the least expensive available endpoint."""
+    if hasattr(client, "get_heart_rates"):
+        try:
+            response = garmin_request(
+                f"resting heart rate lookup {date_str}",
+                lambda: client.get_heart_rates(date_str),
+                max_attempts=2,
+            )
+            if isinstance(response, dict):
+                value = as_int(response.get("restingHeartRate"))
+                if value:
+                    return value
+        except Exception:
+            pass
+
+    for method_name in ("get_daily_summary", "get_daily_summary_v2"):
+        if hasattr(client, method_name):
+            try:
+                response = garmin_request(
+                    f"daily summary lookup {date_str}",
+                    lambda method_name=method_name: getattr(client, method_name)(date_str),
+                    max_attempts=2,
+                )
+                if isinstance(response, dict):
+                    value = as_int(response.get("restingHeartRate"))
+                    if value:
+                        return value
+            except Exception:
+                continue
+    return None
+
+
+def normalize_run_record(activity: dict[str, Any], client) -> dict[str, Any] | None:
+    activity_type = infer_activity_type(activity)
+    if activity_type not in ("Run", "Treadmill run"):
+        return None
+
+    activity_id = as_int(activity.get("activityId"))
+    details = None
+    if activity_id and hasattr(client, "get_activity"):
+        try:
+            details = garmin_request(
+                f"activity detail lookup {activity_id}",
+                lambda: client.get_activity(activity_id),
+                max_attempts=2,
+            )
+        except Exception as error:
+            print(f"  ⚠ Could not fetch details for activity {activity_id}: {error}")
+
+    merged_activity = details if isinstance(details, dict) else activity
+    date_str = parse_activity_date(merged_activity)
+    start_time_local = parse_start_time_local(merged_activity) or parse_start_time_local(activity)
+
+    distance_meters = as_float(
+        first_value(
+            merged_activity.get("distance"),
+            merged_activity.get("distanceMeters"),
+            activity.get("distance"),
+            activity.get("distanceMeters"),
+        )
+    )
+    if not distance_meters or distance_meters <= 0:
+        print(f"  ⚠ Skipping activity {activity_id or 'unknown'} with missing distance")
+        return None
+
+    duration_seconds = as_float(
+        first_value(
+            merged_activity.get("duration"),
+            merged_activity.get("elapsedDuration"),
+            merged_activity.get("movingDuration"),
+            activity.get("duration"),
+            activity.get("elapsedDuration"),
+        )
+    )
+    duration_ms = int(round(duration_seconds * 1000)) if duration_seconds else None
+
+    heart_rate = extract_heart_rate_metrics(activity, details)
+    elevation_gain_feet = extract_elevation_gain_feet(activity, details)
+    needs_tcx = elevation_gain_feet is None or any(value is None for value in heart_rate.values())
+    tcx_payload = download_activity_tcx(client, activity_id) if needs_tcx and activity_id else None
+
+    if tcx_payload:
+        tcx_heart_rate = heart_rate_from_tcx(tcx_payload)
+        for key, value in tcx_heart_rate.items():
+            if heart_rate.get(key) is None and value is not None:
+                heart_rate[key] = value
+        if elevation_gain_feet is None:
+            elevation_gain_feet = elevation_gain_from_tcx(tcx_payload)
+
+    if activity_type == "Treadmill run" and elevation_gain_feet is None:
+        elevation_gain_feet = 0.0
+
+    return {
+        "date": date_str,
+        "activity_id": activity_id,
+        "start_time_local": start_time_local,
+        "activity_name": first_value(merged_activity.get("activityName"), activity.get("activityName")),
+        "distance": distance_meters / 1609.34,
+        "duration_ms": duration_ms,
+        "steps": as_int(first_value(merged_activity.get("steps"), activity.get("steps"), merged_activity.get("stepsCount"), activity.get("stepsCount"))),
+        "calories": as_int(first_value(merged_activity.get("calories"), activity.get("calories"), merged_activity.get("caloriesConsumed"), activity.get("caloriesConsumed"))),
+        "resting_hr": get_resting_heart_rate(date_str, client),
+        "elev_gain": elevation_gain_feet,
+        "activity_type": activity_type,
+        **heart_rate,
+    }
+
+
+def sync_garmin_data(client, db_path: str | Path | None = None, today: date | None = None) -> dict[str, Any]:
+    """Synchronize the recent Garmin activity window into the local SQLite DB."""
+    resolved_db_path = initialize_database(db_path or DB_PATH)
+    sync_start, sync_end = get_sync_window(resolved_db_path, today=today)
+    print(f"Syncing Garmin activities from {sync_start.isoformat()} to {sync_end.isoformat()}...")
+
+    activities = garmin_request(
+        "activity search",
+        lambda: client.get_activities_by_date(sync_start.isoformat(), sync_end.isoformat()),
+    )
+    activities = list(activities or [])
+    print(f"Fetched {len(activities)} total Garmin activities in window")
+
+    synced_runs = []
+    seen_activity_ids = set()
+    for activity in sorted(activities, key=lambda item: parse_start_time_local(item) or ""):
+        activity_id = as_int(activity.get("activityId"))
+        if activity_id is not None and activity_id in seen_activity_ids:
+            continue
+
+        normalized = normalize_run_record(activity, client)
+        if not normalized:
+            continue
+
+        upsert_run(normalized, resolved_db_path)
+        if activity_id is not None:
+            seen_activity_ids.add(activity_id)
+        synced_runs.append(normalized)
+        print(
+            "  ✓ Synced",
+            normalized["date"],
+            normalized["activity_type"],
+            f"{float(normalized['distance']):.2f} mi",
+            f"(activity {normalized.get('activity_id') or 'n/a'})",
+        )
+
+    set_sync_state("last_activity_sync_end", sync_end.isoformat(), resolved_db_path)
+    latest_run = get_latest_run(resolved_db_path)
+    return {
+        "db_path": str(resolved_db_path),
+        "sync_start": sync_start.isoformat(),
+        "sync_end": sync_end.isoformat(),
+        "activity_count": len(activities),
+        "run_count": len(synced_runs),
+        "latest_run": latest_run,
+    }
+
+
+def main() -> int:
+    load_dotenv(SCRIPT_DIR / ".env")
+    email = os.getenv("GARMIN_EMAIL")
+    password = os.getenv("GARMIN_PASSWORD")
+    if not email or not password:
+        print("ERROR: set GARMIN_EMAIL and GARMIN_PASSWORD in .env")
+        return 1
+
+    initialize_database(DB_PATH)
+    print(f"Local store ready at {DB_PATH}")
+    print(f"Bootstrap start date: {DEFAULT_BOOTSTRAP_START_DATE.isoformat()}")
+
+    try:
+        client = login_to_garmin(email, password)
+        print("✓ Garmin authentication successful")
+    except Exception as error:
+        print(f"✗ Garmin authentication failed: {error}")
+        return 1
+
+    try:
+        result = sync_garmin_data(client, db_path=DB_PATH)
+    except Exception as error:
+        print(f"✗ Garmin activity sync failed: {error}")
+        return 1
+
+    print(
+        f"✓ Sync finished: {result['run_count']} run(s) updated "
+        f"from {result['sync_start']} to {result['sync_end']}"
+    )
+    print(f"Latest cached run: {format_run_summary(result['latest_run'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

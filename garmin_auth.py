@@ -1,109 +1,63 @@
 #!/usr/bin/env python3
-"""Helpers for Garmin authentication with graceful rate-limit retries."""
+"""Helpers for Garmin authentication with graceful rate-limit retries.
 
+Compatible with garminconnect >= 0.3.0 (native DI OAuth, no garth).
+"""
+
+import os
 import time
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from pathlib import Path
 
-from garminconnect import Garmin
-
-DEFAULT_MAX_ATTEMPTS = 5
-DEFAULT_INITIAL_DELAY_SECONDS = 30
-DEFAULT_MAX_DELAY_SECONDS = 300
-RATE_LIMIT_HINTS = (
-    "429",
-    "too many requests",
-    "rate limit",
-    "ratelimit",
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectTooManyRequestsError,
 )
 
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_INITIAL_DELAY_SECONDS = 30
+DEFAULT_MAX_DELAY_SECONDS = 120
+DEFAULT_TOKENSTORE_DIR = Path.home() / ".garminconnect"
+MOBILE_SIGNIN_URL = (
+    "https://sso.garmin.com/mobile/sso/en-US/sign-in"
+    "?clientId=GCM_ANDROID_DARK"
+    "&service=https%3A%2F%2Fmobile.integration.garmin.com%2Fgcm%2Fandroid"
+)
+MOBILE_SERVICE_URL = "https://mobile.integration.garmin.com/gcm/android"
 
-def _walk_exception_chain(error):
-    """Yield an exception and any nested exceptions attached to it."""
-    seen = set()
-    pending = [error]
-
-    while pending:
-        current = pending.pop()
-        if current is None:
-            continue
-
-        marker = id(current)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        yield current
-
-        nested = getattr(current, "error", None)
-        if nested is not None:
-            pending.append(nested)
-
-        cause = getattr(current, "__cause__", None)
-        if cause is not None:
-            pending.append(cause)
-
-        context = getattr(current, "__context__", None)
-        if context is not None:
-            pending.append(context)
-
-        for arg in getattr(current, "args", ()):
-            if isinstance(arg, BaseException):
-                pending.append(arg)
-
-
-def _extract_response(error):
-    """Return the first HTTP response object found in an exception chain."""
-    for current in _walk_exception_chain(error):
-        response = getattr(current, "response", None)
-        if response is not None:
-            return response
-    return None
-
-
-def _extract_status_code(error):
-    """Return the first HTTP status code found in an exception chain."""
-    response = _extract_response(error)
-    if response is None:
-        return None
-    return getattr(response, "status_code", None)
-
-
-def _retry_after_seconds(error):
-    """Parse a Retry-After header if present."""
-    response = _extract_response(error)
-    if response is None:
-        return None
-
-    header_value = response.headers.get("Retry-After")
-    if not header_value:
-        return None
-
-    try:
-        return max(0, int(header_value))
-    except (TypeError, ValueError):
-        pass
-
-    try:
-        retry_at = parsedate_to_datetime(header_value)
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=timezone.utc)
-        delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
-        return max(0, int(delay))
-    except (TypeError, ValueError, OverflowError):
-        return None
+RATE_LIMIT_HINTS = ("429", "too many requests", "rate limit")
+BROWSER_BOOTSTRAP_HINTS = ("cloudflare", "just a moment", "portal login failed (non-json): http 403")
 
 
 def is_rate_limit_error(error):
     """Return True when an exception indicates Garmin rate limiting."""
-    if _extract_status_code(error) == 429:
+    if isinstance(error, GarminConnectTooManyRequestsError):
         return True
 
-    for current in _walk_exception_chain(error):
-        message = str(current).lower()
-        if any(hint in message for hint in RATE_LIMIT_HINTS):
+    # v0.3.0 wraps 429 inside GarminConnectAuthenticationError — check the chain.
+    current = error
+    while current is not None:
+        if isinstance(current, GarminConnectTooManyRequestsError):
             return True
+        msg = str(current).lower()
+        if any(hint in msg for hint in RATE_LIMIT_HINTS):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status == 429:
+        return True
 
     return False
+
+
+def should_try_browser_bootstrap(error):
+    """Return True when a stealth browser bootstrap is worth trying."""
+    if is_rate_limit_error(error):
+        return True
+
+    message = str(error).lower()
+    return any(hint in message for hint in BROWSER_BOOTSTRAP_HINTS)
 
 
 def retry_on_rate_limit(
@@ -113,42 +67,149 @@ def retry_on_rate_limit(
     initial_delay_seconds=DEFAULT_INITIAL_DELAY_SECONDS,
     max_delay_seconds=DEFAULT_MAX_DELAY_SECONDS,
 ):
-    """Run an action and retry with exponential backoff when Garmin returns 429."""
+    """Run *action* with exponential backoff on 429 errors.
+
+    Fails loudly (raises) after *max_attempts* so the caller never hangs.
+    """
     for attempt in range(1, max_attempts + 1):
         try:
             return action()
         except Exception as error:
-            should_retry = is_rate_limit_error(error) and attempt < max_attempts
-            if not should_retry:
-                raise
-
-            delay_seconds = min(
-                max_delay_seconds,
-                initial_delay_seconds * (2 ** (attempt - 1)),
-            )
-            retry_after = _retry_after_seconds(error)
-            if retry_after is not None:
-                delay_seconds = min(
-                    max_delay_seconds,
-                    max(delay_seconds, retry_after),
+            if is_rate_limit_error(error) and attempt < max_attempts:
+                delay = min(max_delay_seconds, initial_delay_seconds * (2 ** (attempt - 1)))
+                print(
+                    f"⚠ {description} rate-limited "
+                    f"(attempt {attempt}/{max_attempts}): {error}"
                 )
-
-            print(
-                f"⚠ {description} hit Garmin rate limits "
-                f"(attempt {attempt}/{max_attempts}): {error}"
-            )
-            print(f"  Waiting {delay_seconds} seconds before retrying...")
-            time.sleep(delay_seconds)
+                print(f"  Waiting {delay}s before retrying...")
+                time.sleep(delay)
+            else:
+                raise
 
     raise RuntimeError(f"{description} failed after {max_attempts} attempts")
 
 
-def login_to_garmin(email, password):
-    """Create a Garmin client and log in with 429-aware retries."""
+def get_tokenstore_path(tokenstore=None):
+    """Return the configured Garmin tokenstore directory."""
+    configured = tokenstore or os.getenv("GARMINTOKENS")
+    return Path(configured).expanduser() if configured else DEFAULT_TOKENSTORE_DIR
 
-    def do_login():
+
+def tokenstore_file_exists(tokenstore_path):
+    """Return True when a Garmin tokenstore file already exists."""
+    tokenstore_path = Path(tokenstore_path).expanduser()
+    if tokenstore_path.is_file():
+        return True
+    return (tokenstore_path / "garmin_tokens.json").exists()
+
+
+def persist_tokens(client, tokenstore_path):
+    """Persist refreshed Garmin tokens, warning instead of failing."""
+    try:
+        client.client.dump(str(tokenstore_path))
+    except Exception as exc:
+        print(f"⚠ Could not persist Garmin tokens: {exc}")
+
+
+def login_to_garmin(email, password, tokenstore=None):
+    """Authenticate to Garmin Connect and persist tokens for reuse.
+
+    On first run, performs a full SSO login and writes tokens to
+    *tokenstore_path* so subsequent runs can skip SSO entirely.
+    """
+    tokenstore_path = get_tokenstore_path(tokenstore)
+
+    def login_with_tokenstore():
         client = Garmin(email, password)
-        client.login()
+        client.login(tokenstore=str(tokenstore_path))
+        persist_tokens(client, tokenstore_path)
         return client
 
-    return retry_on_rate_limit(do_login, "Garmin authentication")
+    def login_with_credentials():
+        client = Garmin(email, password)
+        client.login()
+        persist_tokens(client, tokenstore_path)
+        return client
+
+    def login_with_camoufox():
+        try:
+            from camoufox.sync_api import Camoufox
+        except Exception as import_error:
+            raise RuntimeError(
+                "Garmin browser bootstrap requested, but Camoufox is unavailable"
+            ) from import_error
+
+        print("⚠ Falling back to stealth browser login to bootstrap Garmin tokens...")
+        ticket_holder = {}
+        login_error_holder = {}
+
+        with Camoufox(headless=False) as browser:
+            page = browser.new_page()
+
+            def handle_response(response):
+                if "mobile/api/login" not in response.url:
+                    return
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {
+                        "responseStatus": {
+                            "type": "UNKNOWN",
+                            "message": response.text()[:500],
+                        }
+                    }
+
+                response_type = payload.get("responseStatus", {}).get("type")
+                if response_type == "SUCCESSFUL":
+                    ticket_holder["ticket"] = payload.get("serviceTicketId")
+                else:
+                    login_error_holder["payload"] = payload
+
+            page.on("response", handle_response)
+            page.goto(MOBILE_SIGNIN_URL, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(4000)
+            page.locator("input#email").fill(email)
+            page.locator("input#password").fill(password)
+            page.locator("button[type='submit']").click()
+            page.wait_for_timeout(15000)
+
+        if "payload" in login_error_holder:
+            payload = login_error_holder["payload"]
+            response_type = payload.get("responseStatus", {}).get("type")
+            if response_type == "MFA_REQUIRED":
+                raise RuntimeError(
+                    "Garmin browser bootstrap hit MFA and cannot continue non-interactively"
+                )
+            raise RuntimeError(f"Garmin browser bootstrap failed: {payload}")
+
+        ticket = ticket_holder.get("ticket")
+        if not ticket:
+            raise RuntimeError("Garmin browser bootstrap did not capture a service ticket")
+
+        seeded_client = Garmin(email, password)
+        seeded_client.client._establish_session(ticket, service_url=MOBILE_SERVICE_URL)
+        persist_tokens(seeded_client, tokenstore_path)
+
+        verified_client = Garmin(email, password)
+        verified_client.login(tokenstore=str(tokenstore_path))
+        persist_tokens(verified_client, tokenstore_path)
+        return verified_client
+
+    if tokenstore_file_exists(tokenstore_path):
+        try:
+            return login_with_tokenstore()
+        except Exception as error:
+            print(f"⚠ Cached Garmin token reuse failed; falling back to credential login: {error}")
+
+    try:
+        return retry_on_rate_limit(
+            login_with_credentials,
+            "Garmin authentication",
+            max_attempts=DEFAULT_MAX_ATTEMPTS,
+            initial_delay_seconds=DEFAULT_INITIAL_DELAY_SECONDS,
+            max_delay_seconds=DEFAULT_MAX_DELAY_SECONDS,
+        )
+    except Exception as error:
+        if should_try_browser_bootstrap(error):
+            return login_with_camoufox()
+        raise

@@ -17,10 +17,10 @@ def ensure_venv():
     if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
         return  # Already in a venv
 
-    venv_python = SCRIPT_DIR / "venv" / "bin" / "python3"
-
-    if venv_python.exists():
-        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    for env_name in (".venv", "venv"):
+        venv_python = SCRIPT_DIR / env_name / "bin" / "python3"
+        if venv_python.exists():
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
 
 ensure_venv()
 

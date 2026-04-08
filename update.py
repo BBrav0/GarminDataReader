@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Update script that runs the Garmin data update pipeline:
-1. get_tokens.py - Verify Garmin credentials and authentication
-2. db_filler.py - Fetch and cache run data from Garmin API
-3. db_to_csv.py - Export cached data to CSV
+1. db_filler.py - Fetch and cache run data from Garmin API
+2. db_to_csv.py - Export cached data to CSV
 """
 import json
 import sqlite3
@@ -12,6 +11,8 @@ import sys
 import os
 from datetime import date
 from pathlib import Path
+
+from garmin_store import format_run_summary, get_latest_run
 
 SCRIPT_DIR = Path(__file__).parent.absolute()
 RHR_LOG_PATH = Path.home() / ".hermes" / "workspace" / "rhr_log.jsonl"
@@ -23,11 +24,10 @@ if sys.version_info < (3, 6):
 
 def get_venv_python():
     """Find and return the path to the venv Python interpreter."""
-    venv_python = SCRIPT_DIR / "venv" / "bin" / "python3"
-    
-    # Check if venv Python exists
-    if venv_python.exists():
-        return str(venv_python)
+    for env_name in (".venv", "venv"):
+        venv_python = SCRIPT_DIR / env_name / "bin" / "python3"
+        if venv_python.exists():
+            return str(venv_python)
     
     # Fallback: check if we're already in a venv
     if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
@@ -130,9 +130,14 @@ def run_script(script_name):
         print(f"\n✗ Error: {script_name} not found")
         return False
 
+
+def print_latest_run_summary(db_path=None):
+    """Print the latest locally cached run after the pipeline succeeds."""
+    latest_run = get_latest_run(db_path or (SCRIPT_DIR / "cache.db"))
+    print(f"Latest cached run: {format_run_summary(latest_run)}")
+
 if __name__ == "__main__":
     scripts = [
-        "get_tokens.py",
         "db_filler.py",
         "db_to_csv.py"
     ]
@@ -150,4 +155,5 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print("All scripts completed successfully!")
     print(f"{'='*60}")
+    print_latest_run_summary()
 

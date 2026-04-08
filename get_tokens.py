@@ -20,10 +20,10 @@ def ensure_venv():
         return  # Already in a venv
     
     script_dir = Path(__file__).parent.absolute()
-    venv_python = script_dir / "venv" / "bin" / "python3"
-    
-    if venv_python.exists():
-        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    for env_name in (".venv", "venv"):
+        venv_python = script_dir / env_name / "bin" / "python3"
+        if venv_python.exists():
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
 
 ensure_venv()
 
