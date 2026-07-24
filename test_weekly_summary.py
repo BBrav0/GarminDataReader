@@ -18,6 +18,7 @@ class WeeklySummaryTests(unittest.TestCase):
         self.temp_path = Path(self.tempdir.name)
         self.db_path = self.temp_path / "cache.db"
         self.rhr_log_path = self.temp_path / "rhr_log.jsonl"
+        self.body_metrics_log_path = self.temp_path / "body_metrics_log.jsonl"
         self.output_dir = self.temp_path / "charts"
         self.legacy_output_path = self.temp_path / "weekly_summary.png"
         initialize_database(self.db_path)
@@ -72,6 +73,15 @@ class WeeklySummaryTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.body_metrics_log_path.write_text(
+            "\n".join(
+                [
+                    '{"date":"2026-04-10","grpid":"1","metrics":{"weight_lb":148.2,"weight_kg":67.22,"bmi":21.9,"fat_ratio_pct":15.4,"muscle_mass_kg":54.0,"bone_mass_kg":2.85}}',
+                    '{"date":"2026-04-12","grpid":"2","metrics":{"weight_lb":147.8,"weight_kg":67.04,"bmi":21.8,"fat_ratio_pct":15.1,"muscle_mass_kg":54.2,"bone_mass_kg":2.86}}',
+                ]
+            ),
+            encoding="utf-8",
+        )
 
     def test_generate_weekly_charts_writes_separate_pngs(self):
         self.seed_runs()
@@ -80,6 +90,7 @@ class WeeklySummaryTests(unittest.TestCase):
         saved_paths = generate_weekly_charts(
             db_path=self.db_path,
             rhr_log_path=self.rhr_log_path,
+            body_metrics_log_path=self.body_metrics_log_path,
             output_dir=self.output_dir,
             today=date(2026, 4, 12),
             legacy_output_path=self.legacy_output_path,
@@ -96,6 +107,7 @@ class WeeklySummaryTests(unittest.TestCase):
         saved_paths = generate_weekly_charts(
             db_path=self.db_path,
             rhr_log_path=self.rhr_log_path,
+            body_metrics_log_path=self.body_metrics_log_path,
             output_dir=self.output_dir,
             today=date(2026, 4, 12),
             legacy_output_path=self.legacy_output_path,

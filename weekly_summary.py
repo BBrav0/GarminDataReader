@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-weekly_summary.py — generate standalone weekly running charts from cache.db.
-Reads purely from local SQLite — zero Garmin API calls.
+weekly_summary.py — generate standalone weekly running + body metrics charts.
+Reads purely from local SQLite/JSONL logs — zero Garmin/Withings API calls.
 Saves shareable PNG files to /tmp/weekly_summary/
 """
 
@@ -40,6 +40,7 @@ def ensure_venv() -> None:
 # ── Config ────────────────────────────────────────────────────────────
 DB_PATH = SCRIPT_DIR / "cache.db"
 RHR_LOG = Path.home() / ".hermes" / "workspace" / "rhr_log.jsonl"
+BODY_METRICS_LOG = Path.home() / ".hermes" / "workspace" / "body_metrics_log.jsonl"
 OUTPUT_DIR = Path("/tmp/weekly_summary")
 LEGACY_OUT_PATH = Path("/tmp/weekly_summary.png")
 EXPORT_DPI = 220
@@ -61,6 +62,8 @@ CHART_SPECS = (
     ("resting_heart_rate_30_days.png", "Resting Heart Rate"),
     ("aerobic_efficiency.png", "Aerobic Efficiency"),
     ("weekly_mileage_8_weeks.png", "Weekly Mileage"),
+    ("body_composition_30_days.png", "Body Composition"),
+    ("weekly_health_snapshot.png", "Weekly Health Snapshot"),
 )
 
 
@@ -91,6 +94,37 @@ def load_rhr_log(rhr_log_path: Path = RHR_LOG) -> dict[str, int]:
             except Exception:
                 pass
     return entries
+
+
+def load_body_metrics_log(body_metrics_log_path: Path = BODY_METRICS_LOG) -> list[dict]:
+    """Load Withings body metrics JSONL records. One row per measurement group."""
+    rows: list[dict] = []
+    if body_metrics_log_path.exists():
+        for line in body_metrics_log_path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+                metrics = record.get("metrics")
+                date_str = record.get("date")
+                if isinstance(metrics, dict) and date_str:
+                    rows.append(record)
+            except Exception:
+                pass
+    return rows
+
+
+def latest_body_metrics_by_day(rows: list[dict]) -> dict[str, dict]:
+    """Merge Withings measurement groups into one latest metrics dict per date."""
+    by_day: dict[str, dict] = {}
+    for row in sorted(rows, key=lambda r: (str(r.get("date") or ""), str(r.get("grpid") or ""))):
+        date_str = row.get("date")
+        metrics = row.get("metrics")
+        if not date_str or not isinstance(metrics, dict):
+            continue
+        merged = by_day.setdefault(str(date_str), {})
+        for key, value in metrics.items():
+            if value is not None:
+                merged[key] = value
+    return by_day
 
 
 def pace_to_seconds(pace_str: str | None) -> int | None:
@@ -204,6 +238,7 @@ def pluralize(count: int, singular: str, plural: str | None = None) -> str:
 def build_context(
     runs: list[dict],
     rhr_data: dict[str, int],
+    body_metrics_rows: list[dict] | None = None,
     today: date | None = None,
 ) -> dict:
     anchor = today or date.today()
@@ -281,6 +316,35 @@ def build_context(
     week_keys = sorted(weekly.keys())[-8:]
     weekly_points = [{"week_start": week_key, "miles": round(weekly[week_key], 1)} for week_key in week_keys]
 
+    body_by_day = latest_body_metrics_by_day(body_metrics_rows or [])
+    body_dates: list[str] = []
+    body_series = {
+        "weight_lb": [],
+        "bmi": [],
+        "fat_ratio_pct": [],
+        "muscle_mass_kg": [],
+    }
+    for offset in range(29, -1, -1):
+        date_str = (anchor - timedelta(days=offset)).isoformat()
+        metrics = body_by_day.get(date_str)
+        if not metrics:
+            continue
+        if any(metrics.get(key) is not None for key in body_series):
+            body_dates.append(date_str)
+            for key, values in body_series.items():
+                raw = metrics.get(key)
+                try:
+                    values.append(float(raw) if raw is not None else np.nan)
+                except (TypeError, ValueError):
+                    values.append(np.nan)
+
+    latest_body = None
+    for date_str in sorted(body_by_day.keys(), reverse=True):
+        metrics = body_by_day[date_str]
+        if any(metrics.get(key) is not None for key in body_series):
+            latest_body = {"date": date_str, **metrics}
+            break
+
     return {
         "today": anchor,
         "monday": monday,
@@ -296,6 +360,9 @@ def build_context(
         "rhr_vals": rhr_vals,
         "decouple_runs": decouple_runs,
         "weekly_points": weekly_points,
+        "body_dates": body_dates,
+        "body_series": body_series,
+        "latest_body": latest_body,
         "has_runs": bool(runs),
     }
 
@@ -549,16 +616,137 @@ def plot_weekly_mileage(ax, context: dict) -> None:
         ax.set_xlim(-0.4, 0.4)
 
 
+
+def plot_body_composition(ax, context: dict) -> None:
+    style_ax(ax)
+    dates = context["body_dates"]
+    series = context["body_series"]
+    add_chart_header(
+        ax,
+        "Body Composition",
+        "Last 30 days from Withings body_metrics_log.jsonl" if dates else "Needs Withings body metrics data",
+    )
+    if not dates:
+        draw_empty(ax, "No Withings body composition data found")
+        return
+
+    x_values = np.arange(len(dates))
+    plotted = False
+    left_specs = [
+        ("weight_lb", "Weight lb", ACCENT),
+    ]
+    right_specs = [
+        ("fat_ratio_pct", "Body fat %", ACCENT2),
+        ("bmi", "BMI", ACCENT4),
+    ]
+    for key, label, color in left_specs:
+        values = np.array(series[key], dtype=float)
+        if np.isfinite(values).any():
+            ax.plot(x_values, values, marker="o", linewidth=2.2, color=color, label=label, zorder=4)
+            plotted = True
+    ax.set_ylabel("Weight")
+
+    ax2 = ax.twinx()
+    ax2.set_facecolor(PANEL)
+    ax2.tick_params(colors=MUTED, labelsize=9)
+    ax2.spines["right"].set_color(GRID)
+    ax2.yaxis.label.set_color(MUTED)
+    for key, label, color in right_specs:
+        values = np.array(series[key], dtype=float)
+        if np.isfinite(values).any():
+            ax2.plot(x_values, values, marker="s", linewidth=2.0, linestyle="--", color=color, label=label, zorder=4)
+            plotted = True
+    ax2.set_ylabel("BMI / Body fat %")
+
+    if not plotted:
+        draw_empty(ax, "Withings rows found, but no trendable body metrics")
+        return
+
+    latest = context.get("latest_body") or {}
+    latest_label = []
+    if latest.get("weight_lb") is not None:
+        latest_label.append(f"{float(latest['weight_lb']):.1f} lb")
+    if latest.get("fat_ratio_pct") is not None:
+        latest_label.append(f"{float(latest['fat_ratio_pct']):.1f}% fat")
+    if latest_label:
+        ax.text(
+            0.99,
+            1.12,
+            f"Latest {latest.get('date', '')}: " + " • ".join(latest_label),
+            transform=ax.transAxes,
+            ha="right",
+            va="center",
+            fontsize=9,
+            color=ACCENT,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="#16213e", edgecolor=ACCENT, linewidth=1),
+        )
+
+    tick_idx = tick_positions(len(dates), max_ticks=5)
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels([dates[idx][5:] for idx in tick_idx])
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="upper left", frameon=False, fontsize=9, labelcolor=MUTED)
+    ax.margins(x=0.04, y=0.15)
+
+
+def _fmt_metric(value, suffix="", decimals=1) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{decimals}f}{suffix}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def plot_weekly_health_snapshot(ax, context: dict) -> None:
+    ax.set_facecolor(PANEL)
+    ax.axis("off")
+    latest_body = context.get("latest_body") or {}
+    latest_rhr = context["rhr_vals"][-1] if context.get("rhr_vals") else None
+    latest_rhr_date = context["rhr_dates"][-1] if context.get("rhr_dates") else "—"
+    add_chart_header(
+        ax,
+        "Weekly Health Snapshot",
+        f"Week of {short_date_label(context['monday'])} – {short_date_label(context['sunday'])}, {context['sunday'].year}",
+    )
+
+    cards = [
+        ("Miles", f"{context['total_mi']:.1f}", f"{context['num_runs']} runs"),
+        ("Avg Run HR", context["avg_hr_str"], "this week"),
+        ("Resting HR", f"{latest_rhr} bpm" if latest_rhr else "—", latest_rhr_date),
+        ("Weight", _fmt_metric(latest_body.get("weight_lb"), " lb", 1), latest_body.get("date", "—")),
+        ("BMI", _fmt_metric(latest_body.get("bmi"), "", 2), "Withings"),
+        ("Body Fat", _fmt_metric(latest_body.get("fat_ratio_pct"), "%", 1), "Withings"),
+        ("Muscle", _fmt_metric(latest_body.get("muscle_mass_kg"), " kg", 1), "Withings"),
+        ("Bone", _fmt_metric(latest_body.get("bone_mass_kg"), " kg", 2), "Withings"),
+    ]
+
+    for idx, (title, value, subtitle) in enumerate(cards):
+        row, col = divmod(idx, 4)
+        x = 0.04 + col * 0.24
+        y = 0.62 - row * 0.34
+        rect = plt.Rectangle((x, y), 0.20, 0.22, transform=ax.transAxes, facecolor="#16213e", edgecolor=GRID, linewidth=1.2)
+        ax.add_patch(rect)
+        ax.text(x + 0.02, y + 0.16, title, transform=ax.transAxes, ha="left", va="center", color=MUTED, fontsize=10)
+        ax.text(x + 0.02, y + 0.09, value, transform=ax.transAxes, ha="left", va="center", color=TEXT, fontsize=18, fontweight="bold")
+        ax.text(x + 0.02, y + 0.035, str(subtitle), transform=ax.transAxes, ha="left", va="center", color=ACCENT, fontsize=8)
+
+    note = "Running load + recovery/body composition in one view. The coach digest adds interpretation and next-week guidance."
+    ax.text(0.04, 0.08, note, transform=ax.transAxes, ha="left", va="center", color=MUTED, fontsize=10)
+
 def generate_weekly_charts(
     db_path: Path = DB_PATH,
     rhr_log_path: Path = RHR_LOG,
+    body_metrics_log_path: Path = BODY_METRICS_LOG,
     output_dir: Path = OUTPUT_DIR,
     today: date | None = None,
     legacy_output_path: Path = LEGACY_OUT_PATH,
 ) -> list[Path]:
     runs = load_runs(db_path)
     rhr_data = load_rhr_log(rhr_log_path)
-    context = build_context(runs, rhr_data, today=today)
+    body_metrics_rows = load_body_metrics_log(body_metrics_log_path)
+    context = build_context(runs, rhr_data, body_metrics_rows, today=today)
 
     if legacy_output_path.exists():
         legacy_output_path.unlink()
@@ -570,6 +758,8 @@ def generate_weekly_charts(
         ("resting_heart_rate_30_days.png", plot_rhr),
         ("aerobic_efficiency.png", plot_aerobic_efficiency),
         ("weekly_mileage_8_weeks.png", plot_weekly_mileage),
+        ("body_composition_30_days.png", plot_body_composition),
+        ("weekly_health_snapshot.png", plot_weekly_health_snapshot),
     )
 
     saved_paths: list[Path] = []
